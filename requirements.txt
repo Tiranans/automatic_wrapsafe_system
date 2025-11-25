@@ -1,6 +1,8 @@
+uvicorn[standard]
 ultralytics
 pymodbus==3.6.8
 opencv-python
 customtkinter
 pillow
 numpy
+fastapi

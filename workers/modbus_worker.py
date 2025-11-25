@@ -171,8 +171,8 @@ class ModbusWorker(Process):
         else:
             print(f"{level} [{self.worker_id}] {msg}")
     
-    def _initial_connect_with_retry(self, max_retry_delay: int = 10) -> bool:
-      
+    def _initial_connect_with_retry(self, max_retry_delay: int = 30) -> bool:
+        """Connect with exponential backoff, returns True if connected, False if stopped"""
         
         self._log("INFO", f"Attempting connection to {self.connection.host}:{self.connection.port}...")
         
@@ -180,10 +180,12 @@ class ModbusWorker(Process):
             self._log("INFO", f"✓ Connected successfully.")
             return True
         
-        self._log("WARNING", "Initial connection failed, retrying...")
+        self._log("WARNING", "Initial connection failed, entering background retry mode...")
         self._notify_disconnection("Initial connection failed")
         
         retry_delay = 2
+        last_log_time = 0
+        
         while True: # Will break on success or STOP command
             if self._check_stop_command():
                 return False
@@ -191,14 +193,15 @@ class ModbusWorker(Process):
             time.sleep(retry_delay)
             
             if self.connection.connect():
-                self._log("INFO", f" Reconnected successfully.")
+                self._log("INFO", f"✓ Reconnected successfully.")
                 return True
             
-            self._log("WARNING", f"Connection failed. Retrying in {retry_delay}s...")
-            retry_delay = min(max_retry_delay, retry_delay * 2)
+            # Log only occasionally to avoid spam
+            if time.time() - last_log_time > 10:
+                self._log("INFO", f"Still trying to connect... (next retry in {retry_delay}s)")
+                last_log_time = time.time()
             
-            if retry_delay >= max_retry_delay:
-                 self._log("ERROR", f"Failed to connect after multiple attempts.")
+            retry_delay = min(max_retry_delay, retry_delay * 2)
     
     def _check_stop_command(self) -> bool:
         """Check if STOP command is in queue"""

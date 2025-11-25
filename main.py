@@ -1,5 +1,6 @@
 """Main application controller"""
 from multiprocessing import Queue, freeze_support
+from multiprocessing.shared_memory import SharedMemory
 from queue import Empty
 import threading
 import time
@@ -13,6 +14,14 @@ from utils.logger import setup_logger
 import logging
 import numpy as np  
 import cv2           
+import uvicorn
+import os
+
+# Fix for OpenMP runtime conflict (common with YOLO/PyTorch)
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+from backend.main import app as api_app
+from backend.shared import state as api_state
 
 logger = logging.getLogger("Main")
 BM9App = None
@@ -31,6 +40,7 @@ class AppController:
                 'logic_cmd_queue': Queue(),
                 'modbus_di_status_queue': Queue(maxsize=10),
                 'modbus_do_status_queue': Queue(maxsize=10),
+                'di_status_to_yolo_queue': Queue(maxsize=1),  # DI status for YOLO worker
                 'camera_worker': None,
                 'yolo_worker': None,
                 'logic_worker': None,
@@ -45,6 +55,7 @@ class AppController:
                 'logic_cmd_queue': Queue(),
                 'modbus_di_status_queue': Queue(maxsize=10),
                 'modbus_do_status_queue': Queue(maxsize=10),
+                'di_status_to_yolo_queue': Queue(maxsize=1),  # DI status for YOLO worker
                 'camera_worker': None,
                 'yolo_worker': None,
                 'logic_worker': None,
@@ -52,6 +63,28 @@ class AppController:
                 'alarm_active': False,
             }
         }
+
+        # Shared Memory Setup
+        # 1920x1080 RGB = 6,220,800 bytes
+        self.shm_shape = (1080, 1920, 3)
+        self.shm_dtype = np.uint8
+        self.shm_size = int(np.prod(self.shm_shape))
+        self.shared_memories = {}
+        
+        try:
+            for mid in ["A", "B"]:
+                shm_name = f"camera_shm_{mid}"
+                # Create new shared memory
+                shm = SharedMemory(create=True, size=self.shm_size, name=shm_name)
+                self.shared_memories[mid] = shm
+                logger.info(f"Created shared memory: {shm_name} size={self.shm_size}")
+        except FileExistsError:
+            logger.warning("Shared memory already exists. Attempting to reuse/overwrite.")
+
+        # API Integration
+        self.latest_frames = {}
+        api_state.controller = self
+        self._start_api_server()
 
         self.modbus_workers = {}
         
@@ -120,47 +153,31 @@ class AppController:
         except Exception as e:
             logger.exception("Failed to start Wrap_B_DO worker: %s", e)
 
-        # Wrap A DI
+        # Wrap DI (Combined for A and B as they share the same IP)
         try:
             cmd_q_di = Queue()
             status_q_di = Queue()
+            
+            # Determine combined address range
+            start_addr = min(config.DI_A_START_ADDRESS, config.DI_B_START_ADDRESS)
+            end_addr = max(config.DI_A_END_ADDRESS, config.DI_B_END_ADDRESS)
+            
             w_di = ModbusWorker(
                 config.MODBUSWRAP_DI_IP,
                 "DI",
                 None,
                 cmd_q_di,
                 status_q_di,
-                "Wrap_A_DI",
-                addr_start=config.DI_A_START_ADDRESS,
-                addr_end=config.DI_A_END_ADDRESS,
+                "Wrap_DI_Combined",
+                addr_start=start_addr,
+                addr_end=end_addr,
                 port=config.MODBUS_PORT
             )
             w_di.start()
-            self.modbus_workers["Wrap_A_DI"] = {"worker": w_di, "command_queue": cmd_q_di, "status_queue": status_q_di}
-            logger.info(f"Started Modbus worker Wrap_A_DI")
+            self.modbus_workers["Wrap_DI_Combined"] = {"worker": w_di, "command_queue": cmd_q_di, "status_queue": status_q_di}
+            logger.info(f"Started Modbus worker Wrap_DI_Combined (Addr {start_addr}-{end_addr})")
         except Exception as e:
-            logger.exception("Failed to start Wrap_A_DI worker: %s", e)
-
-
-        try:
-            cmd_q_di2 = Queue()
-            status_q_di2 = Queue()
-            w_di2 = ModbusWorker(
-                config.MODBUSWRAP_DI_IP,
-                "DI",
-                None,
-                cmd_q_di2,
-                status_q_di2,
-                "Wrap_B_DI",
-                addr_start=config.DI_B_START_ADDRESS,
-                addr_end=config.DI_B_END_ADDRESS,
-                port=config.MODBUS_PORT
-            )
-            w_di2.start()
-            self.modbus_workers["Wrap_B_DI"] = {"worker": w_di2, "command_queue": cmd_q_di2, "status_queue": status_q_di2}
-            logger.info(f"Started Modbus worker Wrap_B_DI")
-        except Exception as e:
-            logger.exception("Failed to start Wrap_B_DI worker: %s", e)
+            logger.exception("Failed to start Wrap_DI_Combined worker: %s", e)
     
     def _start_machine_workers(self, machine_id: str, camera_url: str):
         """Start all workers for a machine"""
@@ -168,14 +185,40 @@ class AppController:
         
         # Camera worker
         if not m['camera_worker']:
-            cw = CameraWorker(camera_url, m['frame_queue'], m['camera_cmd_queue'], machine_id)
+            cam_queue = m['frame_queue']
+            cam_cmd_queue = m['camera_cmd_queue']
+            
+            shm_name = f"camera_shm_{machine_id}"
+            
+            cw = CameraWorker(
+                camera_url, 
+                cam_queue, 
+                cam_cmd_queue, 
+                machine_id,
+                shm_name=shm_name,
+                shm_shape=self.shm_shape,
+                shm_dtype=self.shm_dtype
+            )
             cw.start()
             m['camera_worker'] = cw
             logger.info(f"Started Camera worker Machine {machine_id}")
         
         # YOLO worker
         if not m['yolo_worker']:
-            yw = YOLOWorker(m['frame_queue'], m['result_queue'], m['yolo_cmd_queue'], machine_id)
+            yolo_cmd_queue = m['yolo_cmd_queue']
+            result_queue = m['result_queue']
+            shm_name = f"camera_shm_{machine_id}"
+            
+            yw = YOLOWorker(
+                m['frame_queue'], 
+                result_queue, 
+                yolo_cmd_queue, 
+                machine_id,
+                shm_name=shm_name,
+                shm_shape=self.shm_shape,
+                shm_dtype=self.shm_dtype,
+                di_status_queue=m['di_status_to_yolo_queue']  # Pass DI status queue
+            )
             yw.start()
             m['yolo_worker'] = yw
             logger.info(f"Started YOLO worker Machine {machine_id}")
@@ -199,7 +242,8 @@ class AppController:
                 modbus_do_command_queue=self.modbus_workers.get(do_worker_id, {}).get('command_queue'),
                 event_queue=self.event_queue,
                 config=logic_config,
-                command_queue=m['logic_cmd_queue']
+                command_queue=m['logic_cmd_queue'],
+                di_status_to_yolo_queue=m['di_status_to_yolo_queue']  # Pass DI status queue
             )
             lw.start()
             m['logic_worker'] = lw
@@ -283,12 +327,17 @@ class AppController:
 
                     # Decode JPEG frame
                     jpg = r.get('frame_jpeg')
-                    if jpg is not None:
+                    
+                    # Cache for API streaming (Always needed for Next.js)
+                    if jpg:
+                        self.latest_frames[mid] = jpg
+
+                    # Update Local UI (Only if enabled)
+                    if jpg is not None and getattr(config, 'SHOW_VIDEO_ON_SERVER_UI', True):
                         try:
                             arr = np.frombuffer(jpg, dtype=np.uint8)
                             vis = cv2.imdecode(arr, cv2.IMREAD_COLOR)
                             if vis is not None:
-                              
                                 self.app.update_camera(mid, vis)
                         except Exception as e:
                             logger.error(f"Machine {mid} JPEG decode error: {e}")
@@ -325,27 +374,51 @@ class AppController:
                 try:
                     status = sq.get_nowait()
                     
-                    # Forward to UI
-                    self.app.update_modbus_status(worker_id, status)
-                    
-                    # Forward to Logic Worker
-                    if "DI" in worker_id:
-                        machine_id = "A" if "Wrap_A" in worker_id else "B"
-                        m = self.machines.get(machine_id)
-                        if m and m.get('modbus_di_status_queue'):
-                            try:
-                                m['modbus_di_status_queue'].put_nowait(status)
-                            except:
-                                pass
-                    
-                    elif "DO" in worker_id:
-                        machine_id = "A" if "Wrap_A" in worker_id else "B"
-                        m = self.machines.get(machine_id)
-                        if m and m.get('modbus_do_status_queue'):
-                            try:
-                                m['modbus_do_status_queue'].put_nowait(status)
-                            except:
-                                pass
+                    # Handle Combined DI Worker
+                    if worker_id == "Wrap_DI_Combined":
+                        # Split data for Machine A (0-7) and B (8-15)
+                        status_a = {k: v for k, v in status.get('values', {}).items() if 0 <= k <= 7}
+                        status_b = {k: v for k, v in status.get('values', {}).items() if 8 <= k <= 15}
+                        
+                        # Update UI (Masquerade as separate workers)
+                        payload_a = status.copy()
+                        payload_a['values'] = status_a
+                        self.app.update_modbus_status("Wrap_A_DI", payload_a)
+                        
+                        payload_b = status.copy()
+                        payload_b['values'] = status_b
+                        self.app.update_modbus_status("Wrap_B_DI", payload_b)
+
+                        # Send to Machine A Logic
+                        if status_a:
+                            m_a = self.machines.get("A")
+                            if m_a and m_a.get('modbus_di_status_queue'):
+                                try:
+                                    m_a['modbus_di_status_queue'].put_nowait({'values': status_a})
+                                except:
+                                    pass
+                                    
+                        # Send to Machine B Logic
+                        if status_b:
+                            m_b = self.machines.get("B")
+                            if m_b and m_b.get('modbus_di_status_queue'):
+                                try:
+                                    m_b['modbus_di_status_queue'].put_nowait({'values': status_b})
+                                except:
+                                    pass
+                                    
+                    else:
+                        # Standard handling for other workers (DOs)
+                        self.app.update_modbus_status(worker_id, status)
+                        
+                        if "DO" in worker_id:
+                            machine_id = "A" if "Wrap_A" in worker_id else "B"
+                            m = self.machines.get(machine_id)
+                            if m and m.get('modbus_do_status_queue'):
+                                try:
+                                    m['modbus_do_status_queue'].put_nowait(status)
+                                except:
+                                    pass
                     
                     count += 1
                 except Empty:
@@ -412,6 +485,24 @@ class AppController:
                 logger.error(f"Modbus {wid} cleanup error: {e}")
         
         logger.info("[Controller] All workers stopped")
+        
+        # Cleanup Shared Memory
+        for mid, shm in self.shared_memories.items():
+            try:
+                shm.close()
+                shm.unlink()
+                logger.info(f"Shared memory {shm.name} unlinked")
+            except Exception as e:
+                logger.error(f"Error cleaning up shared memory {mid}: {e}")
+
+    def _start_api_server(self):
+        """Start FastAPI server in a separate thread"""
+        def run_server():
+            uvicorn.run(api_app, host="0.0.0.0", port=8000, log_level="info")
+        
+        api_thread = threading.Thread(target=run_server, daemon=True)
+        api_thread.start()
+        logger.info("FastAPI server started on port 8000")
 
 def main():
     """Entry point"""

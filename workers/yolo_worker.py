@@ -1,17 +1,30 @@
-"""YOLO detection worker with pose keypoints checking"""
+"""YOLO detection worker with pose keypoints checking and dynamic frame skip"""
 from multiprocessing import Process, Queue
+from multiprocessing.shared_memory import SharedMemory
 from utils.logger import setup_logger
 from ultralytics import YOLO
 import numpy as np
 import time
 import config
 import cv2
+import traceback  # เพิ่ม import ที่นี่
 from collections import deque
+from queue import Empty
 
 logger = setup_logger('YOLOWorker')
 
 class YOLOWorker(Process):
-    def __init__(self, frame_queue: Queue, result_queue: Queue, command_queue: Queue, machine_id: int):
+    def __init__(
+        self, 
+        frame_queue: Queue, 
+        result_queue: Queue, 
+        command_queue: Queue, 
+        machine_id: str,
+        shm_name: str = None,
+        shm_shape: tuple = None,
+        shm_dtype = None,
+        di_status_queue: Queue = None
+    ):
         super().__init__()
         self.frame_queue = frame_queue
         self.result_queue = result_queue
@@ -20,36 +33,62 @@ class YOLOWorker(Process):
         self.running = False
         self.detection_history = deque(maxlen=getattr(config, "DETECTION_MEMORY_FRAMES", 10))
         
-        # ✅ เพิ่มตัวแปรเก็บ ROI (คำนวณครั้งเดียว)
+        # Shared Memory Config
+        self.shm_name = shm_name
+        self.shm_shape = shm_shape
+        self.shm_dtype = shm_dtype
+        self.shm = None
+        self.shared_frame = None
+        
+        # ROI
         self.frame_width = None
         self.frame_height = None
         self.roi_pixels = None
         self.roi_initialized = False
+        
+        # Optimization State
+        self.frame_count = 0
+        self.last_person_detected = False
+        self.last_person_count = 0
+        self.last_results = None
+        
+        # Dynamic Frame Skip - แก้ไขให้ใช้ค่าจาก config
+        self.base_skip = getattr(config, "YOLO_FRAME_SKIP", 1)
+        self.skip_when_no_person = max(1, self.base_skip * 3)  # 3x slower when no person
+        self.skip_when_person = self.base_skip  # Use config value when person detected
+        self.adaptive_skip = self.base_skip
+        
+        # DI Status Queue
+        self.di_status_queue = di_status_queue
+        self.di_enabled = True  # Default to enabled
+        
+        logger.info(f"[{self.machine_id}] Frame skip config: base={self.base_skip}, no_person={self.skip_when_no_person}, person={self.skip_when_person}")
 
     def _init_roi(self, w: int, h: int):
         """Initialize ROI coordinates from first frame (called once)"""
-        # เลือก ROI config ตาม machine_id
-        roi_normalized = config.M1_DETECT_ROI if self.machine_id == 1 else config.M2_DETECT_ROI
+        roi_normalized = config.M1_DETECT_ROI if self.machine_id == "A" else config.M2_DETECT_ROI
         
         x0n, y0n, x1n, y1n = roi_normalized
         
-        # ✅ คำนวณเป็น pixel coordinates (numpy array สำหรับ performance)
         self.roi_pixels = np.array([
             x0n * w,
             y0n * h,
             x1n * w,
             y1n * h
-        ], dtype=np.float32)  # ใช้ float32 แทน float64 (เร็วกว่า)
+        ], dtype=np.float32)
         
         self.frame_width = w
         self.frame_height = h
         self.roi_initialized = True
         
+        roi_width = self.roi_pixels[2] - self.roi_pixels[0]
+        roi_height = self.roi_pixels[3] - self.roi_pixels[1]
+        
         logger.info(
             f"[Machine {self.machine_id}] ROI initialized: "
             f"Frame={w}x{h}, "
-            f"ROI=({self.roi_pixels[0]:.0f}, {self.roi_pixels[1]:.0f}, "
-            f"{self.roi_pixels[2]:.0f}, {self.roi_pixels[3]:.0f})"
+            f"ROI=({int(self.roi_pixels[0])},{int(self.roi_pixels[1])}) to ({int(self.roi_pixels[2])},{int(self.roi_pixels[3])}), "
+            f"Size={int(roi_width)}x{int(roi_height)}"
         )
 
     def _point_in_roi(self, x: float, y: float) -> bool:
@@ -78,172 +117,306 @@ class YOLOWorker(Process):
         
         detected_indices = []
         conf_th = getattr(config, "KEYPOINT_CONF_THRES", 0.25)
+        min_kpts_in_roi = getattr(config, "KEYPOINTS_MIN_IN_ROI", 1)
         
         for person_kpts in keypoints:
+            person_detected_indices = []
             for kpt_idx in check_indices:
                 if kpt_idx >= len(person_kpts):
                     continue
                 x, y, conf = person_kpts[kpt_idx]
                 
                 if conf > conf_th and self._point_in_roi(x, y):
-                    if kpt_idx not in detected_indices:
-                        detected_indices.append(kpt_idx)
+                    if kpt_idx not in person_detected_indices:
+                        person_detected_indices.append(kpt_idx)
+            
+            # ต้องมี keypoints ตามที่กำหนด
+            if len(person_detected_indices) >= min_kpts_in_roi:
+                detected_indices.extend(person_detected_indices)
+                logger.debug(f"[{self.machine_id}] Person has {len(person_detected_indices)} keypoints in ROI: {person_detected_indices}")
         
-        return len(detected_indices) > 0, detected_indices
+        return len(detected_indices) >= min_kpts_in_roi, detected_indices
 
-    def _encode_frame_jpeg(self, frame_bgr):
-        """Resize(optional) and encode BGR frame to JPEG bytes"""
-        try:
-            max_w = getattr(config, "RESULT_FRAME_MAX_WIDTH", None)
-            if max_w and frame_bgr.shape[1] > max_w:
-                scale = max_w / float(frame_bgr.shape[1])
-                new_size = (int(frame_bgr.shape[1] * scale), int(frame_bgr.shape[0] * scale))
-                frame_bgr = cv2.resize(frame_bgr, new_size, interpolation=cv2.INTER_AREA)
-            q = int(getattr(config, "RESULT_JPEG_QUALITY", 85))
-            ok, buf = cv2.imencode(".jpg", frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), q])
-            return buf.tobytes() if ok else None
-        except Exception:
-            return None
-
-    def _draw_overlay(self, frame_bgr, result_obj, person_in_roi):
-        """Draw ROI, BBoxes only (NO Skeleton, NO Keypoints)"""
-        vis = frame_bgr.copy()
-        
-        # Draw ROI
-        if getattr(config, "DRAW_ROI", True):
-            color = config.COLOR_ALARM if person_in_roi else config.COLOR_NORMAL
-            x0, y0, x1, y1 = self.roi_pixels.astype(int)  # ← ใช้ค่าที่เก็บไว้
-            cv2.rectangle(vis, (x0, y0), (x1, y1), color, max(2, config.VIS_THICKNESS))
-        
-        # Draw Bounding Boxes
-        if getattr(config, "DRAW_BBOX", True) and hasattr(result_obj, "boxes") and result_obj.boxes is not None:
-            boxes = result_obj.boxes.xyxy.cpu().numpy().astype(int)
-            for (x0, y0, x1, y1) in boxes:
-                cv2.rectangle(vis, (x0, y0), (x1, y1), config.COLOR_BOX, config.VIS_THICKNESS)
-        
-        return vis
+    def _connect_shared_memory(self):
+        """Connect to existing shared memory block"""
+        if self.shm_name:
+            try:
+                self.shm = SharedMemory(name=self.shm_name)
+                self.shared_frame = np.ndarray(self.shm_shape, dtype=self.shm_dtype, buffer=self.shm.buf)
+                logger.info(f"[{self.machine_id}] Connected to shared memory: {self.shm_name}")
+            except Exception as e:
+                logger.error(f"[{self.machine_id}] Failed to connect to shared memory: {e}")
+                self.shared_frame = None
 
     def run(self):
-        logger.info(f"[Machine {self.machine_id}] YOLO worker started")
+        """Main worker loop"""
+        logger.info(f"[{self.machine_id}] YOLO Worker started - PID={self.pid}")
+        self.running = True
         
-        try:
-            logger.info(f"[Machine {self.machine_id}] Loading model: {config.YOLO_MODEL_PATH}")
-            model = YOLO(config.YOLO_MODEL_PATH)
-            is_pose_model = 'pose' in config.YOLO_MODEL_PATH.lower()
-            logger.info(f"[Machine {self.machine_id}] Model loaded (pose={is_pose_model})")
-        except Exception as e:
-            logger.error(f"[Machine {self.machine_id}] Load model error: {e}")
+        # Load model with retry
+        model = None
+        while self.running and model is None:
+            try:
+                model = YOLO(config.YOLO_MODEL_PATH)
+                logger.info(f"[{self.machine_id}] YOLO model loaded: {config.YOLO_MODEL_PATH}")
+                is_pose_model = 'pose' in config.YOLO_MODEL_PATH.lower()
+            except Exception as e:
+                logger.error(f"[{self.machine_id}] Failed to load YOLO model: {e}")
+                time.sleep(5)
+        
+        if not self.running:
             return
 
-        self.running = True
-
+        self._connect_shared_memory()
+        
         while self.running:
             try:
-                cmd = self.command_queue.get_nowait()
-                if cmd == "STOP":
-                    break
-            except:
-                pass
-
-            frame = None
-            while not self.frame_queue.empty():
+                # Check commands
+                if not self.command_queue.empty():
+                    cmd = self.command_queue.get_nowait()
+                    if cmd == "STOP":
+                        self.running = False
+                        break
+                
+                # Update DI status if available
+                if self.di_status_queue:
+                    try:
+                        while not self.di_status_queue.empty():
+                            di_status = self.di_status_queue.get_nowait()
+                            if self.di_enabled != di_status:
+                                logger.info(f"[{self.machine_id}] DI Status changed: {self.di_enabled} -> {di_status}")
+                                self.di_enabled = di_status
+                    except Empty:
+                        pass
+                
+                # Get frame (or signal)
                 try:
-                    frame = self.frame_queue.get_nowait()
-                except:
-                    break
-            
-            if frame is None:
-                time.sleep(0.0001)
-                continue
-
-            
-            if not self.roi_initialized:
-                h, w = frame.shape[:2]
-                self._init_roi(w, h)
-
-            try:
-                results = model(frame, conf=config.YOLO_CONFIDENCE, verbose=False)
-                r = results[0]
+                    item = self.frame_queue.get(timeout=0.1)
+                except Empty:
+                    continue
                 
-                person_in_roi_raw = False
-                person_count = 0
-                detected_keypoints = []
+                frame = None
+                ts = time.time()
+                
+                if isinstance(item, float):
+                    if self.shared_frame is not None:
+                        frame = self.shared_frame.copy()
+                        ts = item
+                    else:
+                        logger.warning(f"[{self.machine_id}] Received timestamp but SHM not connected")
+                        continue
+                else:
+                    frame = item
+                
+                if frame is None:
+                    continue
 
-                # Check pose keypoints
-                if is_pose_model and hasattr(r, 'keypoints') and r.keypoints is not None:
-                    kpts = r.keypoints.xy.cpu().numpy()
-                    kpts_conf = r.keypoints.conf.cpu().numpy()
+                # Init ROI
+                if not self.roi_initialized:
+                    h, w = frame.shape[:2]
+                    self._init_roi(w, h)
+
+                # Check if detection is enabled via DI
+                di_detection_disabled = False
+                if getattr(config, 'ENABLE_DETECTION_ON_DI', False):
+                    if not self.di_enabled:
+                        di_detection_disabled = True
+
+                # If DI is OFF, skip YOLO but still send frame
+                if di_detection_disabled:
+                    result_data = {
+                        'person_in_roi': False,
+                        'person_count': 0,
+                        'ts': ts,
+                        'raw_detected': False
+                    }
                     
-                    if len(kpts) > 0:
-                        person_count = len(kpts)
-                        kpts_full = np.zeros((len(kpts), 17, 3))
-                        kpts_full[:, :, :2] = kpts
-                        kpts_full[:, :, 2] = kpts_conf
+                    # Still send frame for web display
+                    if config.USE_RESULT_FRAME:
+                        vis_frame = frame.copy()
                         
-                        person_in_roi_raw, detected_keypoints = self._check_keypoints_in_roi(kpts_full)
+                        if config.DRAW_ROI:
+                            rx1, ry1, rx2, ry2 = self.roi_pixels.astype(int)
+                            cv2.rectangle(vis_frame, (rx1, ry1), (rx2, ry2), (128, 128, 128), 2)
+                            cv2.putText(vis_frame, "DETECTION DISABLED", (10, 30), 
+                                      cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                        
+                        vis_frame = cv2.resize(vis_frame, (config.CAMERA_DISPLAY_WIDTH, config.CAMERA_DISPLAY_HEIGHT))
+                        _, jpg = cv2.imencode('.jpg', vis_frame, [int(cv2.IMWRITE_JPEG_QUALITY), config.RESULT_JPEG_QUALITY])
+                        result_data['frame_jpeg'] = jpg.tobytes()
+                    
+                    try:
+                        self.result_queue.put_nowait(result_data)
+                    except:
+                        pass
+                    continue
+
+                # Dynamic Frame Skipping Logic
+                self.frame_count += 1
                 
-                # Fallback to bounding box check
-                if not person_in_roi_raw and getattr(config, "FALLBACK_TO_BBOX", True):
-                    if r.boxes is not None:
-                        boxes = r.boxes.xyxy.cpu().numpy()
-                        clss  = r.boxes.cls.cpu().numpy().astype(int)
-                        names = r.names if hasattr(r, "names") else model.names
-
-                        for b, c in zip(boxes, clss):
-                            is_person = False
-                            if isinstance(names, dict):
-                                is_person = (names.get(c, "") == "person")
-                            else:
-                                is_person = (c == 0)
-                            if not is_person:
-                                continue
+                if self.last_person_detected:
+                    self.adaptive_skip = self.skip_when_person
+                else:
+                    self.adaptive_skip = self.skip_when_no_person
+                
+                should_infer = (self.frame_count % max(1, self.adaptive_skip) == 0)
+                
+                # Inference
+                if should_infer:
+                    logger.info(f"[{self.machine_id}] 🔍 Running YOLO inference on frame {self.frame_count} (skip={self.adaptive_skip})")
+                    
+                    results = model(
+                        frame, 
+                        verbose=False, 
+                        conf=config.YOLO_CONFIDENCE,
+                        imgsz=getattr(config, "YOLO_IMG_SIZE", 320),
+                        half=getattr(config, "YOLO_HALF_PRECISION", False)
+                    )
+                    
+                    person_detected = False
+                    person_count = 0
+                    keypoints = []
+                    
+                    r = results[0]
+                    self.last_results = r
+                    
+                    # Log raw YOLO results
+                    total_detections = len(r.boxes) if r.boxes is not None else 0
+                    logger.info(f"[{self.machine_id}] YOLO found {total_detections} objects")
+                    
+                    # Check pose keypoints
+                    if is_pose_model and hasattr(r, 'keypoints') and r.keypoints is not None:
+                        kpts = r.keypoints.xy.cpu().numpy()
+                        kpts_conf = r.keypoints.conf.cpu().numpy()
+                        
+                        if len(kpts) > 0:
+                            person_count = len(kpts)
+                            kpts_full = np.zeros((len(kpts), 17, 3))
+                            kpts_full[:, :, :2] = kpts
+                            kpts_full[:, :, 2] = kpts_conf
                             
-                            if person_count == 0:
-                                person_count = len([cls for cls in clss if (names.get(cls, "") == "person" if isinstance(names, dict) else cls == 0)])
-                            
-                            ba = max(1.0, (b[2]-b[0]) * (b[3]-b[1]))
-                            ia = self._inter_area(b, self.roi_pixels)  # ← ใช้ค่าที่เก็บไว้
-                            ratio = ia / ba
-                            if ratio >= config.INTERSECT_THRESHOLD:
-                                person_in_roi_raw = True
-                                break
+                            person_detected, keypoints = self._check_keypoints_in_roi(kpts_full)
+                            logger.info(f"[{self.machine_id}] Keypoint check: {person_count} person(s), in_roi={person_detected}, kpts={keypoints}")
+                    
+                    # Fallback to bounding box check
+                    if not person_detected and getattr(config, "FALLBACK_TO_BBOX", True):
+                        if r.boxes is not None and len(r.boxes) > 0:
+                            boxes = r.boxes.xyxy.cpu().numpy()
+                            clss  = r.boxes.cls.cpu().numpy().astype(int)
+                            confs = r.boxes.conf.cpu().numpy()
+                            names = r.names if hasattr(r, "names") else model.names
 
+                            for idx, (b, c, conf) in enumerate(zip(boxes, clss, confs)):
+                                # ตรวจสอบว่าเป็น person อย่างเข้มงวด
+                                is_person = False
+                                if isinstance(names, dict):
+                                    class_name = names.get(c, "")
+                                    is_person = (class_name.lower() == "person")
+                                else:
+                                    # สำหรับ COCO dataset, person = class 0
+                                    is_person = (c == 0)
+                                    class_name = "person" if c == 0 else f"class_{c}"
+                                
+                                # ถ้าไม่ใช่คน ให้ log และข้าม
+                                if not is_person:
+                                    logger.debug(f"[{self.machine_id}] Box {idx}: {class_name}, conf={conf:.2f}, is_person=False - SKIP")
+                                    continue
+                                
+                                # นับจำนวนคน (นับเฉพาะ class person เท่านั้น)
+                                if person_count == 0:
+                                    if isinstance(names, dict):
+                                        person_count = sum(1 for cls in clss if names.get(cls, "").lower() == "person")
+                                    else:
+                                        person_count = sum(1 for cls in clss if cls == 0)
+                                
+                                # Calculate intersection ratio
+                                ba = max(1.0, (b[2]-b[0]) * (b[3]-b[1]))
+                                ia = self._inter_area(b, self.roi_pixels)
+                                ratio = ia / ba
+                                
+                                box_str = f"({int(b[0])},{int(b[1])}) to ({int(b[2])},{int(b[3])})"
+                                logger.info(f"[{self.machine_id}] Person box {idx}: {box_str}, conf={conf:.2f}, overlap={ratio:.3f} (threshold={config.INTERSECT_THRESHOLD})")
+                                
+                                # เช็ค ratio และ confidence
+                                if ratio >= config.INTERSECT_THRESHOLD:
+                                    person_detected = True
+                                    logger.warning(f"[{self.machine_id}] ✅ PERSON DETECTED IN ROI! (overlap={ratio:.3f}, conf={conf:.2f})")
+                                    break
+                                else:
+                                    logger.debug(f"[{self.machine_id}] Person box {idx} overlap too low: {ratio:.3f} < {config.INTERSECT_THRESHOLD}")
+                            
+                            if not person_detected and person_count > 0:
+                                logger.info(f"[{self.machine_id}] Found {person_count} person(s) but none overlap ROI enough (>{config.INTERSECT_THRESHOLD*100:.0f}%)")
+                    
+                    self.last_person_detected = person_detected
+                    self.last_person_count = person_count
+                    
+                else:
+                    # Reuse last detection result
+                    person_detected = self.last_person_detected
+                    person_count = self.last_person_count
+                    logger.debug(f"[{self.machine_id}] Frame {self.frame_count}: Reusing last result (detected={person_detected})")
+                
                 # Temporal smoothing
-                person_in_roi_final = person_in_roi_raw
-                if getattr(config, "USE_TEMPORAL_SMOOTHING", True):
-                    self.detection_history.append(person_in_roi_raw)
-                    recent_detections = sum(self.detection_history)
-                    min_detections = getattr(config, "MIN_DETECTIONS_FOR_ALARM", 3)
-                    person_in_roi_final = (recent_detections >= min_detections)
-
+                self.detection_history.append(person_detected)
+                detection_sum = sum(self.detection_history)
                 
-                
+                if config.USE_TEMPORAL_SMOOTHING:
+                    final_detected = (detection_sum >= config.MIN_DETECTIONS_FOR_ALARM)
+                    logger.info(f"[{self.machine_id}] Temporal smoothing: {detection_sum}/{len(self.detection_history)} >= {config.MIN_DETECTIONS_FOR_ALARM} → {final_detected}")
+                else:
+                    final_detected = person_detected
 
-
-                payload = {
-                    'machine_id': self.machine_id,
-                    'person_in_roi': person_in_roi_final,
+                # Prepare result
+                result_data = {
+                    'person_in_roi': final_detected,
                     'person_count': person_count,
-                    'detected_keypoints': detected_keypoints,
-                    'ts': time.time()
+                    'ts': ts,
+                    'raw_detected': person_detected
                 }
                 
-                if getattr(config, "ATTACH_RESULT_FRAME", True):
-                    if getattr(config, "DRAW_OVERLAY", True):
-                        vis = self._draw_overlay(frame, r, person_in_roi_final)
-                    else:
-                        vis = frame
-                        
-                    jpg = self._encode_frame_jpeg(vis)
-                    if jpg is not None:
-                        payload['frame_jpeg'] = jpg
-
+                # Attach frame if needed
+                if config.USE_RESULT_FRAME:
+                    vis_frame = frame.copy()
+                    
+                    if config.DRAW_ROI:
+                        rx1, ry1, rx2, ry2 = self.roi_pixels.astype(int)
+                        roi_color = (0, 255, 0) if final_detected else config.ROI_COLOR_BGR
+                        cv2.rectangle(vis_frame, (rx1, ry1), (rx2, ry2), roi_color, config.ROI_THICKNESS)
+                    
+                    if self.last_results:
+                        res = self.last_results
+                        if hasattr(res, 'boxes') and res.boxes is not None:
+                            for box in res.boxes:
+                                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+                                cv2.rectangle(vis_frame, (x1, y1), (x2, y2), config.COLOR_BOX, 2)
+                    
+                    # Add detection status text
+                    status_text = f"Person: {final_detected} (raw:{person_detected}) [{detection_sum}/{len(self.detection_history)}]"
+                    cv2.putText(vis_frame, status_text, (10, 30), 
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0) if final_detected else (255, 255, 255), 2)
+                    
+                    vis_frame = cv2.resize(vis_frame, (config.CAMERA_DISPLAY_WIDTH, config.CAMERA_DISPLAY_HEIGHT))
+                    
+                    _, jpg = cv2.imencode('.jpg', vis_frame, [int(cv2.IMWRITE_JPEG_QUALITY), config.RESULT_JPEG_QUALITY])
+                    result_data['frame_jpeg'] = jpg.tobytes()
+                
+                # Send result
                 try:
-                    self.result_queue.put_nowait(payload)
+                    self.result_queue.put_nowait(result_data)
                 except:
                     pass
-
+                
             except Exception as e:
-                logger.exception(f"[Machine {self.machine_id}] Detection error: {e}")
-
-        logger.info(f"[Machine {self.machine_id}] YOLO worker stopped")
+                logger.error(f"[{self.machine_id}] YOLO loop error: {e}")
+                traceback.print_exc()
+                continue
+        
+        # Cleanup
+        if self.shm:
+            try:
+                self.shm.close()
+            except:
+                pass
+        
+        logger.info(f"[{self.machine_id}] YOLO Worker stopped")
