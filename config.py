@@ -12,8 +12,8 @@ MACHINEA_CAMERA_URL = f"rtsp://{CAMERA_USERNAME}:{CAMERA_PASSWORD}@{MACHINEA_CAM
 MACHINEB_CAMERA_IP = "192.168.1.32"
 MACHINEB_CAMERA_URL = f"rtsp://{CAMERA_USERNAME}:{CAMERA_PASSWORD}@{MACHINEB_CAMERA_IP}"
 
-CAMERA_DISPLAY_WIDTH = 480
-CAMERA_DISPLAY_HEIGHT = 360
+CAMERA_DISPLAY_WIDTH = 320
+CAMERA_DISPLAY_HEIGHT = 240
 
 # Modbus Configuration
 MODBUS_PORT = 501
@@ -32,31 +32,28 @@ DI_B_END_ADDRESS = 15
 
 # YOLO / Detection
 YOLO_MODEL_PATH = "models/yolov8n-pose.pt"
-YOLO_CONFIDENCE = 0.2  # เพิ่มขึ้นเพื่อลด False Positive (แนะนำ 0.3-0.5)
+YOLO_CONFIDENCE = 0.15  
 YOLO_FRAME_SKIP = 1
-YOLO_IMG_SIZE = 320
+YOLO_IMG_SIZE = 640 
 YOLO_HALF_PRECISION = False 
 
 # ROI (normalized 0..1: x0,y0,x1,y1)
-# M1_DETECT_ROI = (0.20, 0.02, 0.85, 1.00)
-# M2_DETECT_ROI = (0.15, 0.02, 0.80, 1.00)
-M1_DETECT_ROI = (0.15, 0.02, 0.85, 1.00)  # Machine A: เพิ่มพื้นที่ detection
-M2_DETECT_ROI = (0.10, 0.02, 0.85, 1.00)  # Machine B: ขยาย ROI ให้กว้างขึ้น
+A1_DETECT_ROI = (0.15, 0.02, 0.85, 1.00)  # Machine A
+B2_DETECT_ROI = (0.10, 0.02, 0.85, 1.00)  # Machine B
 ROI_COLOR_BGR = (255, 0, 0)
 ROI_THICKNESS = 10
 
 # Auto stop config
 AUTO_STOP_ON_PERSON = True
 STOP_COOLDOWN_SEC = 3.0
-INTERSECT_THRESHOLD = 0.05  # ลดเหลือ 1% เพื่อทดสอบ
+INTERSECT_THRESHOLD = 0.05  # 5% overlap - สำหรับ bird's eye view
 
-# Keypoints (pose)
-KEYPOINTS_TO_CHECK = [0, 5, 6, 11, 12]
-KEYPOINT_CONF_THRES = 0.25  # ลดลง
+KEYPOINTS_TO_CHECK = [5, 6, 7, 8,9,10, 11, 12, 13, 14,15,16] 
+KEYPOINT_CONF_THRES = 0.25  
 KEYPOINTS_IN_ROI_FRACTION = 0.0
-KEYPOINTS_MIN_IN_ROI = 1
+KEYPOINTS_MIN_IN_ROI = 1  
 
-FALLBACK_TO_BBOX = True
+FALLBACK_TO_BBOX = True  
 
 # Detection Enable Condition (based on Digital Input)
 ENABLE_DETECTION_ON_DI = False  # Only detect when specific DI is ON
@@ -66,7 +63,7 @@ DETECTION_ENABLE_DI_ADDR_B = 8  # Machine B: Check_roll (addr 8)
 # Temporal Smoothing
 USE_TEMPORAL_SMOOTHING = False
 DETECTION_MEMORY_FRAMES = 10
-MIN_DETECTIONS_FOR_ALARM = 1  # ตรวจพบครั้งเดียวก็แจ้ง (เพื่อทดสอบ)
+MIN_DETECTIONS_FOR_ALARM = 1  
 
 # Visualization
 DRAW_OVERLAY = True
@@ -74,7 +71,9 @@ DRAW_ROI = True
 USE_RESULT_FRAME = True  # Enable frame visualization from YOLO
 ATTACH_RESULT_FRAME = False
 RESULT_JPEG_QUALITY = 70
-RESULT_FRAME_MAX_WIDTH = 480
+RESULT_FRAME_MAX_WIDTH = 320
+RESULT_FRAME_MAX_HEIGHT = 240
+
 COLOR_BOX = (0, 255, 0)  # Green color for bounding boxes
 SHOW_VIDEO_ON_SERVER_UI = False  # Disable local UI video rendering for performance
 
@@ -161,6 +160,22 @@ MODBUSWRAP_B_DI_CONFIG = {
         {'label': 'I16', 'addr': 15, 'type': 'DI'}
     ]
 }
+
+# Production Tracking
+PRODUCTION_RUN_DI_ADDR_A = 4   # Machine A wrapping status
+PRODUCTION_RUN_DI_ADDR_B = 12  # Machine B wrapping status
+
+# Database
+DATABASE_PATH = "data/machine_events.db"
+
+# Auto Control
+AUTO_STOP_ON_PERSON = True
+STOP_COOLDOWN_SEC = 3.0
+AUTO_RESET_ON_CLEAR = False  # True = auto reset, False = manual reset
+
+# Capture
+CAPTURE_ON_DETECTION = True
+CAPTURE_DIR = "captures"
 
 # Helper function
 def mb_addr0(addr1):

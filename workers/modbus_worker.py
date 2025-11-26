@@ -339,7 +339,6 @@ class ModbusWorker(Process):
             self._log("ERROR", f"Notification queue error: {e}")
     
     def run(self):
-      
         
         # 1. Setup
         self._log("INFO", f"Worker starting - PID={os.getpid()}")

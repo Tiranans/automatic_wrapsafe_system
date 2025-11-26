@@ -43,12 +43,12 @@ class CameraWorker(Process):
     def _init_roi(self, w: int, h: int):
         """Initialize ROI coordinates from first frame (called once)"""
         if self.machine_id == "A":
-            roi_normalized = config.M1_DETECT_ROI
+            roi_normalized = config.A1_DETECT_ROI
         elif self.machine_id == "B":
-            roi_normalized = config.M2_DETECT_ROI
+            roi_normalized = config.B2_DETECT_ROI
         else:
-            logger.warning(f"Unknown machine_id: {self.machine_id}, using M1_DETECT_ROI")
-            roi_normalized = config.M1_DETECT_ROI
+            logger.warning(f"Unknown machine_id: {self.machine_id}, using A1_DETECT_ROI")
+            roi_normalized = config.A1_DETECT_ROI
         
         x0n, y0n, x1n, y1n = roi_normalized
         

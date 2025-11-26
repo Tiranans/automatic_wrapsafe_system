@@ -11,7 +11,7 @@ export default function Home() {
 
   const fetchStatus = async () => {
     try {
-      const res = await fetch("http://localhost:8000/api/status");
+      const res = await fetch("http://localhost:8061/api/status");
       if (res.ok) {
         const data = await res.json();
         setStatus(data);
@@ -25,7 +25,7 @@ export default function Home() {
 
   const handleControl = async (machineId: string, command: string) => {
     try {
-      await fetch(`http://localhost:8000/api/control/${machineId}`, {
+      await fetch(`http://localhost:8061/api/control/${machineId}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ command }),

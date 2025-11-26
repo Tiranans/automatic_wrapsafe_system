@@ -23,14 +23,14 @@ class MachineState:
     detection_timestamp: float = 0.0
     
     # Capture
-    last_captured_frame: Optional[bytes] = None  # JPEG bytes
+    last_captured_frame: Optional[bytes] = None
     last_captured_timestamp: Optional[str] = None
     last_captured_path: Optional[str] = None
     
-    # Modbus DO status (outputs we control)
+    # Modbus DO status
     do_values: Dict[int, bool] = field(default_factory=dict)
     
-    # Modbus DI status (inputs from machine)
+    # Modbus DI status
     di_values: Dict[int, bool] = field(default_factory=dict)
     
     # Machine status
@@ -43,7 +43,6 @@ class MachineState:
     # Auto-control
     auto_stop_active: bool = False
     last_auto_stop_time: float = 0.0
-
 
 class MachineLogicWorker(Process):
     
@@ -60,44 +59,41 @@ class MachineLogicWorker(Process):
         di_status_to_yolo_queue: Queue = None
     ):
         super().__init__()
-        
         self.machine_id = machine_id
-        
-        # Input queues
         self.yolo_result_queue = yolo_result_queue
         self.modbus_di_status_queue = modbus_di_status_queue
         self.modbus_do_status_queue = modbus_do_status_queue
-        
-        # Output queues
         self.modbus_do_command_queue = modbus_do_command_queue
         self.event_queue = event_queue
+        self.config = config
+        self.command_queue = command_queue
         self.di_status_to_yolo_queue = di_status_to_yolo_queue
         
-        # Control queue
-        self.command_queue = command_queue or Queue()
-        
-        # Configuration
-        self.config = config
-        self.auto_stop_enabled = config.get('auto_stop_enabled', True)
-        self.auto_stop_cooldown = config.get('auto_stop_cooldown', 3.0)
-        self.auto_reset_on_clear = config.get('auto_reset_on_clear', False)
-        
-        # State
         self.state = MachineState(machine_id=machine_id)
         self.running = False
+        
+        # Safety tracking
+        self.last_stop_time = 0
+        self.person_entry_time = None
+        
+        # Production tracking
+        self.prev_wrapping_status = False
+        self.wrapping_start_time = None
+        self.current_log_id = None
+        
+        # Legacy tracking
         self.prev_green_finish = False
         
-        # Callbacks (optional, for testing/mocking)
-        self.on_person_detected = None
-        self.on_person_cleared = None
-        self.on_error_detected = None
-
-        self.capture_enabled = config.get('capture_enabled', True)
-        self.capture_dir = config.get('capture_dir', 'data/captures')
-        os.makedirs(self.capture_dir, exist_ok=True)
+        # Load config values
+        self.auto_stop_enabled = config.get('AUTO_STOP_ON_PERSON', True)
+        self.auto_stop_cooldown = config.get('STOP_COOLDOWN_SEC', 3.0)
+        self.auto_reset_on_clear = config.get('AUTO_RESET_ON_CLEAR', False)
+        self.capture_enabled = config.get('CAPTURE_ON_DETECTION', True)
+        self.capture_dir = config.get('CAPTURE_DIR', 'captures')
         
-        # Track last DI status sent to YOLO
-        self.last_di_status_sent = None
+        # Create capture directory
+        if self.capture_enabled:
+            Path(self.capture_dir).mkdir(parents=True, exist_ok=True)
 
     def run(self):
         """Main worker loop"""
@@ -144,14 +140,16 @@ class MachineLogicWorker(Process):
                     
         except Empty:
             pass
-
+        
     def _process_modbus_status(self):
         """Process latest Modbus DI/DO status"""
         # DI
         try:
             while not self.modbus_di_status_queue.empty():
                 status = self.modbus_di_status_queue.get_nowait()
-                self.state.di_values.update(status)
+                # Extract 'values' dict from status payload
+                di_values = status.get('values', {}) if isinstance(status, dict) else status
+                self.state.di_values.update(di_values)
                 
                 # Send DI status to YOLO worker if enabled
                 self._send_di_status_to_yolo()
@@ -163,7 +161,9 @@ class MachineLogicWorker(Process):
         try:
             while not self.modbus_do_status_queue.empty():
                 status = self.modbus_do_status_queue.get_nowait()
-                self.state.do_values.update(status)
+                # Extract 'values' dict from status payload
+                do_values = status.get('values', {}) if isinstance(status, dict) else status
+                self.state.do_values.update(do_values)
         except Empty:
             pass
         self._trigger_error_alarm()
@@ -194,7 +194,7 @@ class MachineLogicWorker(Process):
 
     def _trigger_auto_stop(self):
         """Trigger auto-stop sequence"""
-        logger.warning(f"[{self.machine_id}] 🚨 PERSON DETECTED → Auto-stopping!")
+        logger.warning(f"[{self.machine_id}] PERSON DETECTED → Auto-stopping!")
         
         # Send STOP command (Pulse DO 1)
         self._write_modbus_do(1, True)
@@ -215,7 +215,7 @@ class MachineLogicWorker(Process):
                 self.state.last_captured_path = capture_path
             except Exception as e:
                 logger.error(f"Failed to save capture: {e}")
-
+        
         self._log_event('AUTO_STOP', {
             'reason': 'Person detected in ROI',
             'person_count': self.state.person_count,
@@ -242,7 +242,7 @@ class MachineLogicWorker(Process):
         })
         
         self._on_person_exit_roi()
-    
+
     def _trigger_error_alarm(self):
         """Trigger error alarm"""
         pass
@@ -250,6 +250,28 @@ class MachineLogicWorker(Process):
     def _on_person_enter_roi(self):
         """Handle person entering ROI"""
         pass
+
+    def _send_di_status_to_yolo(self):
+        """Send DI status to YOLO worker for conditional detection"""
+        if not self.di_status_to_yolo_queue:
+            return
+        
+        di_addr = None
+        if self.machine_id == 'A':
+            di_addr = 0
+
+        elif self.machine_id == 'B':
+            di_addr = 8
+            
+        if di_addr is None:
+            return
+        
+        detection_enabled = self.state.di_values.get(di_addr, False) 
+        
+        try:
+            self.di_status_to_yolo_queue.put_nowait(detection_enabled)
+        except Exception:
+            pass
     
     def _on_person_exit_roi(self):
         """Handle person exiting ROI"""
@@ -257,19 +279,101 @@ class MachineLogicWorker(Process):
         self._log_event('PERSON_EXIT_ROI', {
             'timestamp': datetime.now().isoformat()
         })
+        
+    def _execute_logic(self):
+        """Execute core machine logic"""
+        self._update_machine_status()   # อัปเดตสถานะรวม
+        self._check_safety_rules()      # ตรวจสอบความปลอดภัย (Auto Stop)
+        self._check_production_status() # ตรวจสอบสถานะผลิต
 
     def _check_production_status(self):
-        """Check for production finish signal (Green Light)"""
-        current_green = self.state.do_values.get(7, False)
+        """
+        Check production status based on Run signal (DI)
+        Machine A: addr 4 ON = wrapping, OFF = finished
+        Machine B: addr 12 ON = wrapping, OFF = finished
+        """
+        # Get current wrapping status from DI
+        if self.machine_id == 'A':
+            wrapping_addr = 4
+        elif self.machine_id == 'B':
+            wrapping_addr = 12
+        else:
+            return
         
+        current_wrapping = self.state.di_values.get(wrapping_addr, False)
+        
+        # Detect Rising Edge (OFF -> ON) = Start Wrapping
+        if current_wrapping and not self.prev_wrapping_status:
+            self._on_wrapping_started()
+        
+        # Detect Falling Edge (ON -> OFF) = Finish Wrapping
+        elif not current_wrapping and self.prev_wrapping_status:
+            self._on_wrapping_finished()
+        
+        # Update previous state
+        self.prev_wrapping_status = current_wrapping
+        
+        # Update machine running state
+        self.state.is_running = current_wrapping
+        
+        # Legacy: Still check green light for reference
+        current_green = self.state.do_values.get(7, False)
         if current_green and not self.prev_green_finish:
-            logger.info(f"[{self.machine_id}] Production finished (Green Light ON)")
-            self._log_event('ROLL_FINISHED', {
-                'timestamp': datetime.now().isoformat()
-            })
-            
+            logger.info(f"[{self.machine_id}] Green Light ON (production may be complete)")
         self.prev_green_finish = current_green
-    
+
+    def _on_wrapping_started(self):
+        """Handle wrapping start event (DI ON)"""
+        import time
+        
+        timestamp = time.time()
+        self.wrapping_start_time = timestamp
+        
+        logger.info(
+            f"[{self.machine_id}] 🟢 WRAPPING STARTED "
+            f"(DI addr {4 if self.machine_id == 'A' else 12} = ON)"
+        )
+        
+        # Log event to database
+        self._log_event('ROLL_STARTED', {
+            'timestamp': datetime.now().isoformat(),
+            'di_address': 4 if self.machine_id == 'A' else 12,
+            'machine_status': 'WRAPPING'
+        })
+
+    def _on_wrapping_finished(self):
+        """Handle wrapping finish event (DI OFF)"""
+        import time
+        
+        timestamp = time.time()
+        
+        # Calculate wrapping duration
+        duration_sec = 0
+        if self.wrapping_start_time:
+            duration_sec = timestamp - self.wrapping_start_time
+        
+        duration_min = duration_sec / 60.0
+        
+        logger.info(
+            f"[{self.machine_id}] 🔴 WRAPPING FINISHED "
+            f"(DI addr {4 if self.machine_id == 'A' else 12} = OFF) "
+            f"Duration: {duration_min:.2f} min"
+        )
+        
+        # Log event to database
+        self._log_event('ROLL_FINISHED', {
+            'timestamp': datetime.now().isoformat(),
+            'di_address': 4 if self.machine_id == 'A' else 12,
+            'duration_seconds': int(duration_sec),
+            'duration_minutes': round(duration_min, 2),
+            'machine_status': 'IDLE',
+            'note': None  # สามารถเพิ่ม note ได้ถ้าต้องการ
+        })
+        
+        # Reset tracking
+        self.wrapping_start_time = None
+        self.current_log_id = None
+
     def _write_modbus_do(self, addr: int, value: bool):
         """Send write command to Modbus DO"""
         try:

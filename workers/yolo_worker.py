@@ -7,9 +7,10 @@ import numpy as np
 import time
 import config
 import cv2
-import traceback  # เพิ่ม import ที่นี่
+import traceback 
 from collections import deque
 from queue import Empty
+import config
 
 logger = setup_logger('YOLOWorker')
 
@@ -53,7 +54,7 @@ class YOLOWorker(Process):
         self.last_results = None
         
         # Dynamic Frame Skip - แก้ไขให้ใช้ค่าจาก config
-        self.base_skip = getattr(config, "YOLO_FRAME_SKIP", 1)
+        self.base_skip = config.YOLO_FRAME_SKIP
         self.skip_when_no_person = max(1, self.base_skip * 3)  # 3x slower when no person
         self.skip_when_person = self.base_skip  # Use config value when person detected
         self.adaptive_skip = self.base_skip
@@ -66,7 +67,7 @@ class YOLOWorker(Process):
 
     def _init_roi(self, w: int, h: int):
         """Initialize ROI coordinates from first frame (called once)"""
-        roi_normalized = config.M1_DETECT_ROI if self.machine_id == "A" else config.M2_DETECT_ROI
+        roi_normalized = config.A1_DETECT_ROI if self.machine_id == "A" else config.B2_DETECT_ROI
         
         x0n, y0n, x1n, y1n = roi_normalized
         
@@ -84,12 +85,12 @@ class YOLOWorker(Process):
         roi_width = self.roi_pixels[2] - self.roi_pixels[0]
         roi_height = self.roi_pixels[3] - self.roi_pixels[1]
         
-        logger.info(
-            f"[Machine {self.machine_id}] ROI initialized: "
-            f"Frame={w}x{h}, "
-            f"ROI=({int(self.roi_pixels[0])},{int(self.roi_pixels[1])}) to ({int(self.roi_pixels[2])},{int(self.roi_pixels[3])}), "
-            f"Size={int(roi_width)}x{int(roi_height)}"
-        )
+        # logger.info(
+        #     f"[Machine {self.machine_id}] ROI initialized: "
+        #     f"Frame={w}x{h}, "
+        #     f"ROI=({int(self.roi_pixels[0])},{int(self.roi_pixels[1])}) to ({int(self.roi_pixels[2])},{int(self.roi_pixels[3])}), "
+        #     f"Size={int(roi_width)}x{int(roi_height)}"
+        # )
 
     def _point_in_roi(self, x: float, y: float) -> bool:
         """Check if point (x,y) is inside ROI"""
@@ -111,13 +112,13 @@ class YOLOWorker(Process):
         if keypoints is None or len(keypoints) == 0:
             return False, []
         
-        check_indices = getattr(config, "KEYPOINTS_TO_CHECK", None)
+        check_indices = config.KEYPOINTS_TO_CHECK
         if check_indices is None:
             check_indices = list(range(17))
         
         detected_indices = []
-        conf_th = getattr(config, "KEYPOINT_CONF_THRES", 0.25)
-        min_kpts_in_roi = getattr(config, "KEYPOINTS_MIN_IN_ROI", 1)
+        conf_th = config.KEYPOINT_CONF_THRES
+        min_kpts_in_roi = config.KEYPOINTS_MIN_IN_ROI
         
         for person_kpts in keypoints:
             person_detected_indices = []
@@ -183,6 +184,7 @@ class YOLOWorker(Process):
                     try:
                         while not self.di_status_queue.empty():
                             di_status = self.di_status_queue.get_nowait()
+                            # logger.info(f"[{self.machine_id}] DI Status received: {di_status}")
                             if self.di_enabled != di_status:
                                 logger.info(f"[{self.machine_id}] DI Status changed: {self.di_enabled} -> {di_status}")
                                 self.di_enabled = di_status
@@ -198,7 +200,7 @@ class YOLOWorker(Process):
                 frame = None
                 ts = time.time()
                 
-                if isinstance(item, float):
+                if isinstance(item, float): # coppy from SHM
                     if self.shared_frame is not None:
                         frame = self.shared_frame.copy()
                         ts = item
@@ -218,7 +220,8 @@ class YOLOWorker(Process):
 
                 # Check if detection is enabled via DI
                 di_detection_disabled = False
-                if getattr(config, 'ENABLE_DETECTION_ON_DI', False):
+                print(f"[{self.machine_id}] DI Enabled: {self.di_enabled}")
+                if config.ENABLE_DETECTION_ON_DI :
                     if not self.di_enabled:
                         di_detection_disabled = True
 
@@ -239,7 +242,7 @@ class YOLOWorker(Process):
                             rx1, ry1, rx2, ry2 = self.roi_pixels.astype(int)
                             cv2.rectangle(vis_frame, (rx1, ry1), (rx2, ry2), (128, 128, 128), 2)
                             cv2.putText(vis_frame, "DETECTION DISABLED", (10, 30), 
-                                      cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                         
                         vis_frame = cv2.resize(vis_frame, (config.CAMERA_DISPLAY_WIDTH, config.CAMERA_DISPLAY_HEIGHT))
                         _, jpg = cv2.imencode('.jpg', vis_frame, [int(cv2.IMWRITE_JPEG_QUALITY), config.RESULT_JPEG_QUALITY])
@@ -263,14 +266,14 @@ class YOLOWorker(Process):
                 
                 # Inference
                 if should_infer:
-                    logger.info(f"[{self.machine_id}] 🔍 Running YOLO inference on frame {self.frame_count} (skip={self.adaptive_skip})")
+                    # logger.info(f"[{self.machine_id}] 🔍 Running YOLO inference on frame {self.frame_count} (skip={self.adaptive_skip})")
                     
                     results = model(
                         frame, 
                         verbose=False, 
                         conf=config.YOLO_CONFIDENCE,
-                        imgsz=getattr(config, "YOLO_IMG_SIZE", 320),
-                        half=getattr(config, "YOLO_HALF_PRECISION", False)
+                        imgsz= config.YOLO_IMG_SIZE,
+                        half=config.YOLO_HALF_PRECISION
                     )
                     
                     person_detected = False
@@ -282,7 +285,7 @@ class YOLOWorker(Process):
                     
                     # Log raw YOLO results
                     total_detections = len(r.boxes) if r.boxes is not None else 0
-                    logger.info(f"[{self.machine_id}] YOLO found {total_detections} objects")
+                    # logger.info(f"[{self.machine_id}] YOLO found {total_detections} objects")
                     
                     # Check pose keypoints
                     if is_pose_model and hasattr(r, 'keypoints') and r.keypoints is not None:
@@ -299,7 +302,7 @@ class YOLOWorker(Process):
                             logger.info(f"[{self.machine_id}] Keypoint check: {person_count} person(s), in_roi={person_detected}, kpts={keypoints}")
                     
                     # Fallback to bounding box check
-                    if not person_detected and getattr(config, "FALLBACK_TO_BBOX", True):
+                    if not person_detected and config.FALLBACK_TO_BBOX:
                         if r.boxes is not None and len(r.boxes) > 0:
                             boxes = r.boxes.xyxy.cpu().numpy()
                             clss  = r.boxes.cls.cpu().numpy().astype(int)
@@ -307,7 +310,7 @@ class YOLOWorker(Process):
                             names = r.names if hasattr(r, "names") else model.names
 
                             for idx, (b, c, conf) in enumerate(zip(boxes, clss, confs)):
-                                # ตรวจสอบว่าเป็น person อย่างเข้มงวด
+                                # ตรวจสอบว่าเป็น person 
                                 is_person = False
                                 if isinstance(names, dict):
                                     class_name = names.get(c, "")
@@ -319,7 +322,7 @@ class YOLOWorker(Process):
                                 
                                 # ถ้าไม่ใช่คน ให้ log และข้าม
                                 if not is_person:
-                                    logger.debug(f"[{self.machine_id}] Box {idx}: {class_name}, conf={conf:.2f}, is_person=False - SKIP")
+                                    # logger.debug(f"[{self.machine_id}] Box {idx}: {class_name}, conf={conf:.2f}, is_person=False - SKIP")
                                     continue
                                 
                                 # นับจำนวนคน (นับเฉพาะ class person เท่านั้น)
@@ -340,7 +343,7 @@ class YOLOWorker(Process):
                                 # เช็ค ratio และ confidence
                                 if ratio >= config.INTERSECT_THRESHOLD:
                                     person_detected = True
-                                    logger.warning(f"[{self.machine_id}] ✅ PERSON DETECTED IN ROI! (overlap={ratio:.3f}, conf={conf:.2f})")
+                                    logger.warning(f"[{self.machine_id}]  PERSON DETECTED IN ROI! (overlap={ratio:.3f}, conf={conf:.2f})")
                                     break
                                 else:
                                     logger.debug(f"[{self.machine_id}] Person box {idx} overlap too low: {ratio:.3f} < {config.INTERSECT_THRESHOLD}")
@@ -350,7 +353,7 @@ class YOLOWorker(Process):
                     
                     self.last_person_detected = person_detected
                     self.last_person_count = person_count
-                    
+                
                 else:
                     # Reuse last detection result
                     person_detected = self.last_person_detected
@@ -366,7 +369,7 @@ class YOLOWorker(Process):
                     logger.info(f"[{self.machine_id}] Temporal smoothing: {detection_sum}/{len(self.detection_history)} >= {config.MIN_DETECTIONS_FOR_ALARM} → {final_detected}")
                 else:
                     final_detected = person_detected
-
+                
                 # Prepare result
                 result_data = {
                     'person_in_roi': final_detected,

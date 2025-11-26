@@ -307,16 +307,16 @@ class AppController:
             
             if cam_worker and not cam_worker.is_alive():
                 logger.error(f"Machine {mid} Camera worker is DEAD!")
-                self.app.add_log(f" Machine {mid} Camera worker stopped!")
+                # self.app.add_log(f" Machine {mid} Camera worker stopped!")
                 # self._restart_worker(cam_worker, mid)
             
             if yolo_worker and not yolo_worker.is_alive():
                 logger.error(f"Machine {mid} YOLO worker is DEAD!")
-                self.app.add_log(f" Machine {mid} YOLO worker stopped!")
+                # self.app.add_log(f" Machine {mid} YOLO worker stopped!")
             
             if logic_worker and not logic_worker.is_alive():
                 logger.error(f"Machine {mid} Logic worker is DEAD!")
-                self.app.add_log(f" Machine {mid} Logic worker stopped!")
+                # self.app.add_log(f" Machine {mid} Logic worker stopped!")
             
             # Poll YOLO results
             got = 0
@@ -498,11 +498,11 @@ class AppController:
     def _start_api_server(self):
         """Start FastAPI server in a separate thread"""
         def run_server():
-            uvicorn.run(api_app, host="0.0.0.0", port=8000, log_level="info")
+            uvicorn.run(api_app, host="0.0.0.0", port=8061, log_level="info")
         
         api_thread = threading.Thread(target=run_server, daemon=True)
         api_thread.start()
-        logger.info("FastAPI server started on port 8000")
+        logger.info("FastAPI server started on port 8061")
 
 def main():
     """Entry point"""
@@ -521,7 +521,6 @@ def main():
         logger.exception(f"Fatal error: {e}")
     finally:
         logger.info("Application exited")
-
 
 if __name__ == "__main__":
     main()
