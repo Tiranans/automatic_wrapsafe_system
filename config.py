@@ -56,7 +56,7 @@ KEYPOINTS_MIN_IN_ROI = 1
 FALLBACK_TO_BBOX = True  
 
 # Detection Enable Condition (based on Digital Input)
-ENABLE_DETECTION_ON_DI = False  # Only detect when specific DI is ON
+ENABLE_DETECTION_ON_DI = True  # Only detect when specific DI is ON
 DETECTION_ENABLE_DI_ADDR_A = 0  # Machine A: Check_roll (addr 0)
 DETECTION_ENABLE_DI_ADDR_B = 8  # Machine B: Check_roll (addr 8)
 
@@ -176,6 +176,12 @@ AUTO_RESET_ON_CLEAR = False  # True = auto reset, False = manual reset
 # Capture
 CAPTURE_ON_DETECTION = True
 CAPTURE_DIR = "captures"
+
+# Production Capture
+PRODUCTION_CAPTURE_ENABLED = True
+PRODUCTION_CAPTURE_DIR = "production_captures"
+PRODUCTION_CAPTURE_ON_START = True
+PRODUCTION_CAPTURE_ON_FINISH = True
 
 # Helper function
 def mb_addr0(addr1):

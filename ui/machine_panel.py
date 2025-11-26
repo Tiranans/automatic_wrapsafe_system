@@ -62,7 +62,7 @@ class MachinePanel(ctk.CTkFrame):
         
         self.camera_label = ctk.CTkLabel(
             camera_frame,
-            text="Waiting for camera...",
+            text="Stream video with web only",
             width=self.cam_width,
             height=self.cam_height,
             fg_color="black",

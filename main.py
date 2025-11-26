@@ -4,6 +4,7 @@ from multiprocessing.shared_memory import SharedMemory
 from queue import Empty
 import threading
 import time
+from datetime import datetime
 import config
 from workers.camera_worker import CameraWorker
 from workers.yolo_worker import YOLOWorker
@@ -15,7 +16,7 @@ import logging
 import numpy as np  
 import cv2           
 import uvicorn
-import os
+import os   
 
 # Fix for OpenMP runtime conflict (common with YOLO/PyTorch)
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -107,7 +108,7 @@ class AppController:
         self.app.after(100, self._poll_modbus_status)
 
         logger.info("Application initialized")
-        self.app.add_log("System initialized - All workers running")
+        self.app.add_log(f"System initialized - All workers running {datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')}")
     
     def _start_modbus_workers(self):
         """Start all Modbus workers"""
@@ -256,7 +257,7 @@ class AppController:
     def _send_write_coil(self, worker_id: str, addr: int, value: bool):
         """Send write command to Modbus worker"""
         if worker_id not in self.modbus_workers:
-            self.app.add_log(f" [{worker_id}] not found")
+            self.app.add_log(f" [{worker_id}] not found {datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')}")
             logger.error(f"Modbus worker {worker_id} not found")
             return
         
@@ -280,21 +281,21 @@ class AppController:
         """Send START command to machine via Modbus"""
         worker_id = self._worker_id_for_machine(machine_id)
         self._pulse_coil(worker_id, config.CONTROL_BUTTON_START_ADDR)
-        self.app.add_log(f"[Machine {machine_id}] START command sent")
+        self.app.add_log(f"[Machine {machine_id}] START command sent {datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')}")
         logger.info(f"Machine {machine_id} START button pressed")
 
     def stop_machine(self, machine_id: str): 
         """Send STOP command to machine via Modbus"""
         worker_id = self._worker_id_for_machine(machine_id)
         self._pulse_coil(worker_id, config.CONTROL_BUTTON_STOP_ADDR)
-        self.app.add_log(f" [Machine {machine_id}] STOP command sent")
+        self.app.add_log(f" [Machine {machine_id}] STOP command sent {datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')}")
         logger.info(f"Machine {machine_id} STOP button pressed")
 
     def reset_machine(self, machine_id: str): 
         """Send RESET command to machine via Modbus"""
         worker_id = self._worker_id_for_machine(machine_id)
         self._pulse_coil(worker_id, config.CONTROL_BUTTON_RESET_ADDR)
-        self.app.add_log(f" [Machine {machine_id}] RESET command sent")
+        self.app.add_log(f" [Machine {machine_id}] RESET command sent {datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')}")
         logger.info(f"Machine {machine_id} RESET button pressed")
 
     def _poll_frames(self):
@@ -362,7 +363,7 @@ class AppController:
             worker = w_data.get("worker")
             if worker and not worker.is_alive():
                 logger.error(f"Modbus worker {worker_id} is DEAD!")
-                self.app.add_log(f" {worker_id} worker stopped!")
+                self.app.add_log(f" {worker_id} worker stopped! {datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')}")
                 continue
             
             sq = w_data.get("status_queue")

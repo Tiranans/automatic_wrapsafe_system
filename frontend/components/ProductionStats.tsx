@@ -25,9 +25,17 @@ export default function ProductionStats() {
     const [stats, setStats] = useState<ProductionData | null>(null);
     const [loading, setLoading] = useState(true);
 
+    // Get API URL - use current hostname with port 8061
+    const getApiUrl = () => {
+        if (typeof window !== 'undefined') {
+            return `http://${window.location.hostname}:8061`;
+        }
+        return 'http://localhost:8061';
+    };
+
     const fetchStats = async () => {
         try {
-            const res = await fetch("http://localhost:8000/api/production/stats");
+            const res = await fetch(`${getApiUrl()}/api/production/stats`);
             if (res.ok) {
                 const data = await res.json();
                 setStats(data);
@@ -69,7 +77,7 @@ export default function ProductionStats() {
                             <th className="px-4 py-3 text-center">Shift 1 (08-16)</th>
                             <th className="px-4 py-3 text-center">Shift 2 (16-00)</th>
                             <th className="px-4 py-3 text-center">Shift 3 (00-08)</th>
-                            <th className="px-4 py-3 text-right rounded-tr-lg">Total</th>
+                            <th className="px-4 py-3 text-right text-gray-900 font-medium rounded-tr-lg">Total</th>
                         </tr>
                     </thead>
                     <tbody>
@@ -87,7 +95,7 @@ export default function ProductionStats() {
                                     <td className="px-4 py-4 text-center font-mono text-orange-600">
                                         {mStats?.shifts[3] || 0}
                                     </td>
-                                    <td className="px-4 py-4 text-right font-bold text-lg">
+                                    <td className="px-4 py-4 text-right font-medium text-gray-900 text-lg">
                                         {mStats?.total || 0}
                                     </td>
                                 </tr>

@@ -79,6 +79,7 @@ class MachineLogicWorker(Process):
         # Production tracking
         self.prev_wrapping_status = False
         self.wrapping_start_time = None
+        self.check_roll_status = False
         self.current_log_id = None
         
         # Legacy tracking
@@ -91,9 +92,17 @@ class MachineLogicWorker(Process):
         self.capture_enabled = config.get('CAPTURE_ON_DETECTION', True)
         self.capture_dir = config.get('CAPTURE_DIR', 'captures')
         
-        # Create capture directory
+        # Production capture config
+        self.production_capture_enabled = config.get('PRODUCTION_CAPTURE_ENABLED', True)
+        self.production_capture_dir = config.get('PRODUCTION_CAPTURE_DIR', 'production_captures')
+        self.production_capture_on_start = config.get('PRODUCTION_CAPTURE_ON_START', True)
+        self.production_capture_on_finish = config.get('PRODUCTION_CAPTURE_ON_FINISH', True)
+        
+        # Create capture directories
         if self.capture_enabled:
             Path(self.capture_dir).mkdir(parents=True, exist_ok=True)
+        if self.production_capture_enabled:
+            Path(self.production_capture_dir).mkdir(parents=True, exist_ok=True)
 
     def run(self):
         """Main worker loop"""
@@ -170,7 +179,50 @@ class MachineLogicWorker(Process):
 
     def _update_machine_status(self):
         """Update high-level machine status based on DI/DO"""
-        pass
+        if self.machine_id == 'A':
+            machine_ready = self.state.di_values.get(5, False) 
+            # print("machine_ready A  >> ",machine_ready)
+            
+            if machine_ready == True :
+            
+                self._write_modbus_do(5, True) #    Machine A: addr 5 ON = machine ready, OFF = machine not ready
+         
+            else:
+            
+                self._write_modbus_do(5, False) #    Machine A: addr 5 ON = machine ready, OFF = machine not ready
+
+            check_film_ok = self.state.di_values.get(1, False)
+            machine_run = self.state.di_values.get(4, False)
+
+            if machine_run == False :
+                if check_film_ok == True :
+                    pass
+                    self._write_modbus_do(8, False) #    Machine A: addr 8 ON = film ok, OFF = film not ok
+                else:
+                    pass
+                    self._write_modbus_do(8, True) #    Machine A: addr 8 ON = film ok, OFF = film not ok
+            
+        elif self.machine_id == 'B':
+
+            machine_ready = self.state.di_values.get(13, False) 
+            if machine_ready == True :
+                pass
+                self._write_modbus_do(5, True) # Machine B: addr 13 ON = machine ready, OFF = machine not ready
+            else:
+                pass
+                self._write_modbus_do(5, False) # Machine B: addr 13 ON = machine ready, OFF = machine not ready
+
+            check_film_ok = self.state.di_values.get(9, False)
+            machine_run = self.state.di_values.get(12, False)
+
+            if machine_run == False :
+                if check_film_ok == True :
+                    pass
+                    self._write_modbus_do(8, False) #    Machine B: addr 8 ON = film ok, OFF = film not ok
+                else:
+                    pass
+                    self._write_modbus_do(8, True) #    Machine B: addr 8 ON = film ok, OFF = film not ok
+
 
     def _check_safety_rules(self):
         """Check safety rules (Auto-Stop)"""
@@ -207,12 +259,22 @@ class MachineLogicWorker(Process):
         # Save capture if available
         capture_path = None
         if self.capture_enabled and self.state.last_captured_frame:
-            filename = f"capture_{self.machine_id}_{int(time.time())}.jpg"
-            capture_path = os.path.join(self.capture_dir, filename)
+            # Create machine-specific folder
+            now = datetime.now()
+            date_str = now.strftime('%Y-%m-%d')
+            machine_folder = f"Machine{self.machine_id}"
+            save_dir = Path(self.capture_dir) / machine_folder / date_str
+            save_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Filename: Machine{ID}_{YYYYMMDD}_{HHMMSS}_AUTOSTOP.jpg
+            time_str = now.strftime('%H%M%S')
+            filename = f"Machine{self.machine_id}_{now.strftime('%Y%m%d')}_{time_str}_AUTOSTOP.jpg"
+            capture_path = save_dir / filename
+            
             try:
                 with open(capture_path, "wb") as f:
                     f.write(self.state.last_captured_frame)
-                self.state.last_captured_path = capture_path
+                self.state.last_captured_path = str(capture_path)
             except Exception as e:
                 logger.error(f"Failed to save capture: {e}")
         
@@ -294,33 +356,99 @@ class MachineLogicWorker(Process):
         """
         # Get current wrapping status from DI
         if self.machine_id == 'A':
-            wrapping_addr = 4
+            wrapping_addr = 4  # addr 4 ON = wrapping, OFF = finished
+            check_roll = 0 # addr 0 ON = roll detected, OFF = roll not detected
+            machine_ready = 5 # addr 5 ON = machine ready, OFF = machine not ready
         elif self.machine_id == 'B':
-            wrapping_addr = 12
+            wrapping_addr = 12 # addr 12 ON = wrapping, OFF = finished
+            check_roll = 8 # addr 8 ON = roll detected, OFF = roll not detected
+            machine_ready = 13 # addr 13 ON = machine ready, OFF = machine not ready
         else:
             return
+
+        # addr 5 ON = machine ready, OFF = machine not ready
+        blue_run = 6 # addr 6 ON = machine ready, OFF = machine not ready
+        green_finish = 7 # addr 7 ON = machine ready, OFF = machine not ready
+        yellow_film = 8 # addr 8 ON = machine ready, OFF = machine not ready
+        red_problem = 9 # addr 9 ON = machine ready, OFF = machine not ready    
         
         current_wrapping = self.state.di_values.get(wrapping_addr, False)
+        check_roll_status = self.state.di_values.get(check_roll, False)
+        machine_ready_status = self.state.di_values.get(machine_ready, False)
         
-        # Detect Rising Edge (OFF -> ON) = Start Wrapping
-        if current_wrapping and not self.prev_wrapping_status:
-            self._on_wrapping_started()
-        
-        # Detect Falling Edge (ON -> OFF) = Finish Wrapping
-        elif not current_wrapping and self.prev_wrapping_status:
-            self._on_wrapping_finished()
-        
-        # Update previous state
-        self.prev_wrapping_status = current_wrapping
-        
-        # Update machine running state
-        self.state.is_running = current_wrapping
-        
+        if machine_ready_status == True :
+            # print("ready....")
+            # Detect Rising Edge (OFF -> ON) = Start Wrapping
+            if current_wrapping and not self.prev_wrapping_status:
+                if check_roll_status == True and machine_ready_status == True :
+                    # print("wrap ..............................start")
+                    self._on_wrapping_started()
+                    self._write_modbus_do(6, True) # ON  blue_run
+                    self._write_modbus_do(7, False) # OFF green_finnished
+
+
+                else:
+                    logger.warning(f"[{self.machine_id}] Wrapping started but roll not detected")
+            
+            # Detect Falling Edge (ON -> OFF) = Finish Wrapping
+            elif not current_wrapping and self.prev_wrapping_status:    
+                if check_roll_status == False and machine_ready_status == True :
+                    # print("wrap.............................. finished")
+                    self._on_wrapping_finished()
+                    self._write_modbus_do(6, False) # OFF blue_run
+                    self._write_modbus_do(7, True) # ON green_finnished
+                else:
+                    logger.warning(f"[{self.machine_id}] Wrapping finished but roll not detected")
+            
+            # Update previous state
+            self.prev_wrapping_status = current_wrapping
+            
+            # Update machine running state
+            self.state.is_running = current_wrapping
+          
         # Legacy: Still check green light for reference
-        current_green = self.state.do_values.get(7, False)
-        if current_green and not self.prev_green_finish:
-            logger.info(f"[{self.machine_id}] Green Light ON (production may be complete)")
-        self.prev_green_finish = current_green
+        # current_green = self.state.do_values.get(7, False)
+        # if current_green and not self.prev_green_finish:
+        #     logger.info(f"[{self.machine_id}] Green Light ON (production may be complete)")
+        # self.prev_green_finish = current_green
+
+    def _capture_production_image(self, event_type: str) -> Optional[str]:
+        """Capture production image with date-based folder structure
+        
+        Args:
+            event_type: 'START' or 'FINISH'
+            
+        Returns:
+            Path to saved image or None
+        """
+        if not self.production_capture_enabled or not self.state.last_captured_frame:
+            return None
+            
+        try:
+            # Get current datetime
+            now = datetime.now()
+            date_str = now.strftime('%Y-%m-%d')
+            time_str = now.strftime('%H%M%S')
+            
+            # Create machine-specific date folder: production_captures/Machine{ID}/{Date}/
+            machine_folder = f"Machine{self.machine_id}"
+            save_dir = Path(self.production_capture_dir) / machine_folder / date_str
+            save_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Generate filename: Machine{ID}_{YYYYMMDD}_{HHMMSS}_{EVENT}.jpg
+            filename = f"Machine{self.machine_id}_{now.strftime('%Y%m%d')}_{time_str}_{event_type}.jpg"
+            filepath = save_dir / filename
+            
+            # Save image
+            with open(filepath, 'wb') as f:
+                f.write(self.state.last_captured_frame)
+            
+            logger.info(f"[{self.machine_id}] Production image captured: {filepath}")
+            return str(filepath)
+            
+        except Exception as e:
+            logger.error(f"[{self.machine_id}] Failed to capture production image: {e}")
+            return None
 
     def _on_wrapping_started(self):
         """Handle wrapping start event (DI ON)"""
@@ -334,11 +462,17 @@ class MachineLogicWorker(Process):
             f"(DI addr {4 if self.machine_id == 'A' else 12} = ON)"
         )
         
+        # Capture image on start
+        capture_path = None
+        if self.production_capture_on_start:
+            capture_path = self._capture_production_image('START')
+        
         # Log event to database
         self._log_event('ROLL_STARTED', {
             'timestamp': datetime.now().isoformat(),
             'di_address': 4 if self.machine_id == 'A' else 12,
-            'machine_status': 'WRAPPING'
+            'machine_status': 'WRAPPING',
+            'capture_path': capture_path
         })
 
     def _on_wrapping_finished(self):
@@ -360,6 +494,11 @@ class MachineLogicWorker(Process):
             f"Duration: {duration_min:.2f} min"
         )
         
+        # Capture image on finish
+        capture_path = None
+        if self.production_capture_on_finish:
+            capture_path = self._capture_production_image('FINISH')
+        
         # Log event to database
         self._log_event('ROLL_FINISHED', {
             'timestamp': datetime.now().isoformat(),
@@ -367,7 +506,8 @@ class MachineLogicWorker(Process):
             'duration_seconds': int(duration_sec),
             'duration_minutes': round(duration_min, 2),
             'machine_status': 'IDLE',
-            'note': None  # สามารถเพิ่ม note ได้ถ้าต้องการ
+            'note': None,  # สามารถเพิ่ม note ได้ถ้าต้องการ
+            'capture_path': capture_path
         })
         
         # Reset tracking
