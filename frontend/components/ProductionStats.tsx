@@ -74,9 +74,9 @@ export default function ProductionStats() {
                     <thead className="text-xs text-gray-700 uppercase bg-gray-50">
                         <tr>
                             <th className="px-4 py-3 rounded-tl-lg">Machine</th>
-                            <th className="px-4 py-3 text-center">Shift 1 (08-16)</th>
-                            <th className="px-4 py-3 text-center">Shift 2 (16-00)</th>
-                            <th className="px-4 py-3 text-center">Shift 3 (00-08)</th>
+                            <th className="px-4 py-3 text-center">A Shift (08-16)</th>
+                            <th className="px-4 py-3 text-center">B Shift (16-00)</th>
+                            <th className="px-4 py-3 text-center">C Shift (00-08)</th>
                             <th className="px-4 py-3 text-right text-gray-900 font-medium rounded-tr-lg">Total</th>
                         </tr>
                     </thead>

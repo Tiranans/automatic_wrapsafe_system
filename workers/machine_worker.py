@@ -6,6 +6,7 @@ from datetime import datetime
 import time
 import logging
 import os
+import sqlite3
 from pathlib import Path
 import base64
 from utils.logger import setup_logger
@@ -78,9 +79,12 @@ class MachineLogicWorker(Process):
         
         # Production tracking
         self.prev_wrapping_status = False
+        self.prev_check_roll_status = False
         self.wrapping_start_time = None
         self.check_roll_status = False
         self.current_log_id = None
+        self.is_waiting_for_removal = False
+        self.removal_wait_start_time = None
         
         # Legacy tracking
         self.prev_green_finish = False
@@ -103,6 +107,9 @@ class MachineLogicWorker(Process):
             Path(self.capture_dir).mkdir(parents=True, exist_ok=True)
         if self.production_capture_enabled:
             Path(self.production_capture_dir).mkdir(parents=True, exist_ok=True)
+        
+        # Database path for recovery
+        self.db_path = "data/machine_events.db"
 
     def run(self):
         """Main worker loop"""
@@ -181,15 +188,11 @@ class MachineLogicWorker(Process):
         """Update high-level machine status based on DI/DO"""
         if self.machine_id == 'A':
             machine_ready = self.state.di_values.get(5, False) 
-            # print("machine_ready A  >> ",machine_ready)
             
             if machine_ready == True :
-            
-                self._write_modbus_do(5, True) #    Machine A: addr 5 ON = machine ready, OFF = machine not ready
-         
+                self._write_modbus_do(5, True)
             else:
-            
-                self._write_modbus_do(5, False) #    Machine A: addr 5 ON = machine ready, OFF = machine not ready
+                self._write_modbus_do(5, False)
 
             check_film_ok = self.state.di_values.get(1, False)
             machine_run = self.state.di_values.get(4, False)
@@ -197,20 +200,19 @@ class MachineLogicWorker(Process):
             if machine_run == False :
                 if check_film_ok == True :
                     pass
-                    self._write_modbus_do(8, False) #    Machine A: addr 8 ON = film ok, OFF = film not ok
+                    self._write_modbus_do(8, False)
                 else:
                     pass
-                    self._write_modbus_do(8, True) #    Machine A: addr 8 ON = film ok, OFF = film not ok
+                    self._write_modbus_do(8, True)
             
         elif self.machine_id == 'B':
-
             machine_ready = self.state.di_values.get(13, False) 
             if machine_ready == True :
                 pass
-                self._write_modbus_do(5, True) # Machine B: addr 13 ON = machine ready, OFF = machine not ready
+                self._write_modbus_do(5, True)
             else:
                 pass
-                self._write_modbus_do(5, False) # Machine B: addr 13 ON = machine ready, OFF = machine not ready
+                self._write_modbus_do(5, False)
 
             check_film_ok = self.state.di_values.get(9, False)
             machine_run = self.state.di_values.get(12, False)
@@ -218,11 +220,10 @@ class MachineLogicWorker(Process):
             if machine_run == False :
                 if check_film_ok == True :
                     pass
-                    self._write_modbus_do(8, False) #    Machine B: addr 8 ON = film ok, OFF = film not ok
+                    self._write_modbus_do(8, False)
                 else:
                     pass
-                    self._write_modbus_do(8, True) #    Machine B: addr 8 ON = film ok, OFF = film not ok
-
+                    self._write_modbus_do(8, True)
 
     def _check_safety_rules(self):
         """Check safety rules (Auto-Stop)"""
@@ -321,7 +322,6 @@ class MachineLogicWorker(Process):
         di_addr = None
         if self.machine_id == 'A':
             di_addr = 0
-
         elif self.machine_id == 'B':
             di_addr = 8
             
@@ -344,73 +344,177 @@ class MachineLogicWorker(Process):
         
     def _execute_logic(self):
         """Execute core machine logic"""
-        self._update_machine_status()   # อัปเดตสถานะรวม
-        self._check_safety_rules()      # ตรวจสอบความปลอดภัย (Auto Stop)
-        self._check_production_status() # ตรวจสอบสถานะผลิต
+        self._update_machine_status()
+        self._check_safety_rules()
+        self._check_production_status()
+
+    def _get_last_unfinished_roll(self):
+        """Get last unfinished roll from database for state recovery"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            
+            # Find ROLL_STARTED without matching ROLL_FINISHED in events table
+            cursor.execute("""
+                SELECT 
+                    e1.id,
+                    e1.timestamp,
+                    e1.data
+                FROM events e1
+                WHERE e1.machine_id = ?
+                  AND e1.event_type = 'ROLL_STARTED'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM events e2
+                      WHERE e2.machine_id = e1.machine_id
+                        AND e2.event_type = 'ROLL_FINISHED'
+                        AND e2.timestamp > e1.timestamp
+                  )
+                ORDER BY e1.timestamp DESC
+                LIMIT 1
+            """, (self.machine_id,))
+            
+            row = cursor.fetchone()
+            conn.close()
+            
+            if row:
+                start_time = row['timestamp']
+                minutes_ago = (time.time() - start_time) / 60.0
+                
+                return {
+                    'log_id': row['id'],
+                    'start_time': start_time,
+                    'minutes_ago': minutes_ago
+                }
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"[{self.machine_id}] Error checking unfinished rolls: {e}")
+            return None
 
     def _check_production_status(self):
         """
-        Check production status based on Run signal (DI)
-        Machine A: addr 4 ON = wrapping, OFF = finished
-        Machine B: addr 12 ON = wrapping, OFF = finished
+        Check production status with state recovery
+        - Recovers unfinished rolls from database on startup
+        - Start: wrapping OFF -> ON (when roll present)
+        - Finish: wrapping ON -> OFF AND roll removed
         """
-        # Get current wrapping status from DI
+        # Get DI addresses
         if self.machine_id == 'A':
-            wrapping_addr = 4  # addr 4 ON = wrapping, OFF = finished
-            check_roll = 0 # addr 0 ON = roll detected, OFF = roll not detected
-            machine_ready = 5 # addr 5 ON = machine ready, OFF = machine not ready
+            wrapping_addr = 4
+            check_roll_addr = 0
+            machine_ready_addr = 5
         elif self.machine_id == 'B':
-            wrapping_addr = 12 # addr 12 ON = wrapping, OFF = finished
-            check_roll = 8 # addr 8 ON = roll detected, OFF = roll not detected
-            machine_ready = 13 # addr 13 ON = machine ready, OFF = machine not ready
+            wrapping_addr = 12
+            check_roll_addr = 8
+            machine_ready_addr = 13
         else:
             return
 
-        # addr 5 ON = machine ready, OFF = machine not ready
-        blue_run = 6 # addr 6 ON = machine ready, OFF = machine not ready
-        green_finish = 7 # addr 7 ON = machine ready, OFF = machine not ready
-        yellow_film = 8 # addr 8 ON = machine ready, OFF = machine not ready
-        red_problem = 9 # addr 9 ON = machine ready, OFF = machine not ready    
+        # DO addresses
+        blue_run = 6
+        green_finish = 7
         
+        # Read current DI
         current_wrapping = self.state.di_values.get(wrapping_addr, False)
-        check_roll_status = self.state.di_values.get(check_roll, False)
-        machine_ready_status = self.state.di_values.get(machine_ready, False)
+        check_roll_current = self.state.di_values.get(check_roll_addr, False)
+        machine_ready = self.state.di_values.get(machine_ready_addr, False)
         
-        if machine_ready_status == True :
-            # print("ready....")
-            # Detect Rising Edge (OFF -> ON) = Start Wrapping
-            if current_wrapping and not self.prev_wrapping_status:
-                if check_roll_status == True and machine_ready_status == True :
-                    # print("wrap ..............................start")
-                    self._on_wrapping_started()
-                    self._write_modbus_do(6, True) # ON  blue_run
-                    self._write_modbus_do(7, False) # OFF green_finnished
-
-
-                else:
-                    logger.warning(f"[{self.machine_id}] Wrapping started but roll not detected")
-            
-            # Detect Falling Edge (ON -> OFF) = Finish Wrapping
-            elif not current_wrapping and self.prev_wrapping_status:    
-                if check_roll_status == False and machine_ready_status == True :
-                    # print("wrap.............................. finished")
-                    self._on_wrapping_finished()
-                    self._write_modbus_do(6, False) # OFF blue_run
-                    self._write_modbus_do(7, True) # ON green_finnished
-                else:
-                    logger.warning(f"[{self.machine_id}] Wrapping finished but roll not detected")
-            
-            # Update previous state
+        # Update machine running state
+        self.state.is_running = current_wrapping
+        
+        # ต้องเครื่องพร้อมก่อน
+        if not machine_ready:
+            # Reset states when not ready
             self.prev_wrapping_status = current_wrapping
+            self.prev_check_roll_status = check_roll_current
+            self.is_waiting_for_removal = False
+            self.wrapping_start_time = None
+            return
+
+        # ========== STATE RECOVERY: Check for unfinished roll ==========
+        # ถ้าไม่มี wrapping_start_time แต่เครื่องกำลังพัน หรือรอยกออก
+        if self.wrapping_start_time is None:
+            if current_wrapping or (check_roll_current and not current_wrapping):
+                unfinished = self._get_last_unfinished_roll()
+                if unfinished:
+                    self.wrapping_start_time = unfinished['start_time']
+                    self.current_log_id = unfinished['log_id']
+                    
+                    if current_wrapping:
+                        logger.info(f"[{self.machine_id}] 🔄 RECOVERED: Active wrapping session (started {unfinished['minutes_ago']:.1f} min ago)")
+                    else:
+                        logger.info(f"[{self.machine_id}] 🔄 RECOVERED: Waiting for roll removal (started {unfinished['minutes_ago']:.1f} min ago)")
+                        self.is_waiting_for_removal = True
+                        self.removal_wait_start_time = time.time()
+
+        # ========== EDGE CASE: Roll removed while wrapping ==========
+        if current_wrapping and not check_roll_current and self.prev_check_roll_status:
+            logger.warning(f"[{self.machine_id}] ⚠️ ABNORMAL: Roll removed while wrapping!")
+            # ไม่นับเป็นงานเสร็จ เพราะยังพันไม่เสร็จ
+            self.is_waiting_for_removal = False
+            self.wrapping_start_time = None
+
+        # ========== DETECT START: wrapping OFF -> ON ==========
+        if current_wrapping and not self.prev_wrapping_status:
+            # ต้องมี Roll ก่อนถึงจะเริ่มนับ
+            if check_roll_current:
+                # ตรวจสอบว่าไม่ได้อยู่ในสถานะรอยกออก (ป้องกันการนับซ้ำ)
+                if not self.is_waiting_for_removal:
+                    logger.info(f"[{self.machine_id}] 🟢 WRAP START (Roll detected)")
+                    self._on_wrapping_started()
+                    self._write_modbus_do(blue_run, True)
+                    self._write_modbus_do(green_finish, False)
+                    self.is_waiting_for_removal = False
+                else:
+                    logger.warning(f"[{self.machine_id}] ⚠️ Wrapping started but still waiting for previous roll removal - IGNORED")
+            else:
+                logger.warning(f"[{self.machine_id}] ⚠️ Wrapping started but NO ROLL detected - IGNORED")
+
+        # ========== DETECT WRAPPING STOP: wrapping ON -> OFF ==========
+        elif not current_wrapping and self.prev_wrapping_status:
+            # ต้องมีการเริ่มงานก่อน (wrapping_start_time ไม่เป็น None)
+            if self.wrapping_start_time is not None:
+                logger.info(f"[{self.machine_id}] 🟡 WRAPPING STOPPED (Waiting for roll removal)")
+                self._write_modbus_do(blue_run, False)
+                # ยังไม่จบงาน รอคนยกออกก่อน
+                self.is_waiting_for_removal = True
+                self._write_modbus_do(green_finish, True)
+                self.removal_wait_start_time = time.time()  # เริ่มจับเวลารอ
+            else:
+                logger.warning(f"[{self.machine_id}] ⚠️ Wrapping stopped but no start time - IGNORED")
+
+        # ========== DETECT REMOVAL: Roll ON -> OFF ==========
+        # เช็คว่าพันเสร็จแล้ว (is_waiting_for_removal) และของถูกยกออก (check_roll OFF)
+        if self.is_waiting_for_removal:
+            # ตรวจสอบ Timeout (ถ้ารอนานเกิน 5 นาที ให้บังคับจบงาน)
+            if self.removal_wait_start_time is not None:
+                wait_duration = time.time() - self.removal_wait_start_time
+                if wait_duration > 300:  # 5 minutes timeout
+                    logger.warning(f"[{self.machine_id}] ⏰ TIMEOUT: Waited {wait_duration:.0f}s for roll removal - Force completing")
+                    self._on_wrapping_finished()
+                    self._write_modbus_do(green_finish, False)
+                    self.is_waiting_for_removal = False
+                    self.removal_wait_start_time = None
             
-            # Update machine running state
-            self.state.is_running = current_wrapping
-          
-        # Legacy: Still check green light for reference
-        # current_green = self.state.do_values.get(7, False)
-        # if current_green and not self.prev_green_finish:
-        #     logger.info(f"[{self.machine_id}] Green Light ON (production may be complete)")
-        # self.prev_green_finish = current_green
+            # ตรวจจับการยก Roll ออก (Edge: ON -> OFF)
+            if not check_roll_current and self.prev_check_roll_status:
+                logger.info(f"[{self.machine_id}] 🔴 COMPLETE (Roll removed)")
+                self._on_wrapping_finished()
+                self._write_modbus_do(green_finish, False)
+                self.is_waiting_for_removal = False
+                self.removal_wait_start_time = None
+
+        # ========== EDGE CASE: Roll placed while waiting ==========
+        if self.is_waiting_for_removal and not self.prev_check_roll_status and check_roll_current:
+            logger.warning(f"[{self.machine_id}] ⚠️ ABNORMAL: New roll placed while waiting for removal!")
+            # อาจเป็นการวาง Roll ใหม่ ให้รีเซ็ตสถานะ
+            # แต่ไม่นับเป็นงานเสร็จ
+
+        # Update Previous State (ต้องอยู่ท้ายสุดเสมอ)
+        self.prev_wrapping_status = current_wrapping
+        self.prev_check_roll_status = check_roll_current
 
     def _capture_production_image(self, event_type: str) -> Optional[str]:
         """Capture production image with date-based folder structure
@@ -452,8 +556,6 @@ class MachineLogicWorker(Process):
 
     def _on_wrapping_started(self):
         """Handle wrapping start event (DI ON)"""
-        import time
-        
         timestamp = time.time()
         self.wrapping_start_time = timestamp
         
@@ -477,8 +579,6 @@ class MachineLogicWorker(Process):
 
     def _on_wrapping_finished(self):
         """Handle wrapping finish event (DI OFF)"""
-        import time
-        
         timestamp = time.time()
         
         # Calculate wrapping duration
@@ -506,7 +606,7 @@ class MachineLogicWorker(Process):
             'duration_seconds': int(duration_sec),
             'duration_minutes': round(duration_min, 2),
             'machine_status': 'IDLE',
-            'note': None,  # สามารถเพิ่ม note ได้ถ้าต้องการ
+            'note': None,
             'capture_path': capture_path
         })
         

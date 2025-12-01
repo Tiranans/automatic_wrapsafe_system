@@ -14,8 +14,8 @@ class MachinePanel(ctk.CTkFrame):
         self.on_stop = on_stop
         self.on_reset = on_reset
         
-        self.cam_width = camera_width or config.CAMERA_DISPLAY_WIDTH
-        self.cam_height = camera_height or config.CAMERA_DISPLAY_HEIGHT
+        self.cam_width = 320
+        self.cam_height = 240
         
         self._img_ref = None
 

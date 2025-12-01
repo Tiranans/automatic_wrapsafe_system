@@ -533,7 +533,7 @@ export default function ReportPage() {
               <div className="bg-white rounded-lg shadow-sm p-6">
                 <h3 className="text-xl font-bold text-gray-900 mb-4">Production Images</h3>
                 <div className="grid md:grid-cols-4 gap-4">
-                  {images.map((img, idx) => (
+                  {/* {images.map((img, idx) => (
                     <div key={idx} className="border border-gray-200 rounded-lg p-3">
                       <img
                         src={`${getApiUrl()}/static/${img.path.replace(/\\/g, '/')}`}
@@ -548,7 +548,7 @@ export default function ReportPage() {
                         {new Date(img.modified_time).toLocaleTimeString('th-TH')}
                       </div>
                     </div>
-                  ))}
+                  ))} */}
                 </div>
               </div>
             )}

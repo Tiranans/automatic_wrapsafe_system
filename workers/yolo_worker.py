@@ -270,7 +270,7 @@ class YOLOWorker(Process):
                     
                     results = model(
                         frame, 
-                        verbose=False, 
+                        verbose=False,  # Disable verbose output mean disable print 
                         conf=config.YOLO_CONFIDENCE,
                         imgsz= config.YOLO_IMG_SIZE,
                         half=config.YOLO_HALF_PRECISION

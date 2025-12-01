@@ -253,7 +253,7 @@ class AppController:
     def _worker_id_for_machine(self, machine_id: str) -> str: 
         """Get Modbus worker ID for machine"""
         return f"Wrap_{machine_id}_DO" 
-
+    
     def _send_write_coil(self, worker_id: str, addr: int, value: bool):
         """Send write command to Modbus worker"""
         if worker_id not in self.modbus_workers:

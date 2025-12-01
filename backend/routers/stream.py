@@ -5,7 +5,7 @@ from backend.shared import state
 
 router = APIRouter()
 
-def generate_mjpeg(machine_id: str):
+async def generate_mjpeg(machine_id: str):
     """Generator for MJPEG stream"""
     while True:
         if not state.controller:
@@ -20,7 +20,7 @@ def generate_mjpeg(machine_id: str):
             yield (b'--frame\r\n'
                    b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
         
-        time.sleep(0.04) # ~25 FPS cap
+        await time.sleep(0.05) # ~25 FPS cap
 
 @router.get("/{machine_id}")
 def video_feed(machine_id: str):
