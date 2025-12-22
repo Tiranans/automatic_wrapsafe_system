@@ -63,6 +63,12 @@ class YOLOWorker(Process):
         self.di_status_queue = di_status_queue
         self.di_enabled = True  # Default to enabled
         
+        # Roll Clamp Detection State
+        self.last_roll_clamp_detected = False
+        self.roll_clamp_released_time = None
+        self.auto_start_delay_seconds = 180  # 3 minutes = 180 seconds
+        self.auto_start_triggered = False
+        
         logger.info(f"[{self.machine_id}] Frame skip config: base={self.base_skip}, no_person={self.skip_when_no_person}, person={self.skip_when_person}")
 
     def _init_roi(self, w: int, h: int):
@@ -233,7 +239,68 @@ class YOLOWorker(Process):
                         'ts': ts,
                         'raw_detected': False
                     }
+
+                    # Detect Roll clamp (white/gray metal)
+                    if config.ENABLE_ROLL_CLAMP_DETECTION:
+                        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+                        gray_bgr = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                        
+                        # Detect white/light gray metal (high brightness, low saturation)
+                        lower_metal = np.array([0, 0, 180])  # Low saturation, high value
+                        upper_metal = np.array([180, 50, 255])  # Any hue, low saturation, high brightness
+                        mask_metal = cv2.inRange(hsv, lower_metal, upper_metal)
+                        
+                        # Additional gray metal detection (medium brightness)
+                        _, gray_mask = cv2.threshold(gray_bgr, 150, 255, cv2.THRESH_BINARY)
+                        
+                        # Combine masks
+                        mask_combined = cv2.bitwise_or(mask_metal, gray_mask)
+                        metal_pixels = cv2.countNonZero(mask_combined)
+                        total_pixels = frame.shape[0] * frame.shape[1]
+                        metal_ratio = metal_pixels / total_pixels
+                        
+                        roll_clamp_detected = metal_ratio > config.ROLL_CLAMP_METAL_GRAY_THRESHOLD
+                        if roll_clamp_detected:
+                            logger.warning(f"[{self.machine_id}] ROLL CLAMP DETECTED! Metal ratio: {metal_ratio:.3f}")
+                        
+                        result_data['roll_clamp_detected'] = roll_clamp_detected
+
                     
+                    # Detest paper roll
+                    if config.ENABLE_PAPER_ROLL_DETECTION:
+                        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+                        # === 1. การกำหนดช่วงสี ===
+    
+                        # 1.1 ช่วงสีขาว (White Thresholding) - เหมือนเดิม
+                        lower_white = np.array([0, 0, 200])
+                        upper_white = np.array([180, 25, 255])
+                        
+                        # 1.2 ช่วงสีน้ำตาล (Brown Thresholding) - ค่าตัวอย่างที่ปรับจูน
+                        # Hue: 10-40 (ส้ม-เหลือง)
+                        # Saturation: 50-255 (อิ่มตัวปานกลาง-สูง)
+                        # Value: 50-200 (ความสว่างปานกลาง-ต่ำ)
+                        lower_brown = np.array([10, 50, 50])
+                        upper_brown = np.array([40, 255, 200])
+
+                        # สร้างมาสก์สำหรับสีขาว
+                        mask_white = cv2.inRange(hsv, lower_white, upper_white)
+                        
+                        mask_brown = cv2.inRange(hsv, lower_brown, upper_brown)
+
+                        mask_combined = cv2.bitwise_or(mask_white, mask_brown)
+                        combined_pixels = cv2.countNonZero(mask_combined)
+                        total_pixels = frame.shape[0] * frame.shape[1]
+                        
+                        combined_ratio = combined_pixels / total_pixels
+
+                        paper_roll_detected = combined_ratio > config.PAPER_ROLL_COLOR_RATIO_THRESHOLD 
+
+                        if paper_roll_detected:
+                            logger.warning(f"[{self.machine_id}] PAPER ROLL DETECTED! White ratio: {combined_ratio:.3f}")
+                        
+                        result_data['paper_roll_detected'] = paper_roll_detected
+
                     # Still send frame for web display
                     if config.USE_RESULT_FRAME:
                         vis_frame = frame.copy()
@@ -243,6 +310,20 @@ class YOLOWorker(Process):
                             cv2.rectangle(vis_frame, (rx1, ry1), (rx2, ry2), (128, 128, 128), 2)
                             cv2.putText(vis_frame, "DETECTION DISABLED", (10, 30), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                        
+                        # Display Roll Clamp status
+                        if config.ENABLE_ROLL_CLAMP_DETECTION:
+                            clamp_status = "CLAMP: YES" if result_data.get('roll_clamp_detected', False) else "CLAMP: NO"
+                            clamp_color = (0, 255, 255) if result_data.get('roll_clamp_detected', False) else (128, 128, 128)
+                            cv2.putText(vis_frame, clamp_status, (10, 60), 
+                                      cv2.FONT_HERSHEY_SIMPLEX, 0.7, clamp_color, 2)
+                        
+                        # Display Paper Roll status
+                        if config.ENABLE_PAPER_ROLL_DETECTION:
+                            paper_status = "PAPER ROLL: YES" if result_data.get('paper_roll_detected', False) else "PAPER ROLL: NO"
+                            paper_color = (255, 255, 0) if result_data.get('paper_roll_detected', False) else (255, 0, 255)
+                            cv2.putText(vis_frame, paper_status, (10, 90), 
+                                      cv2.FONT_HERSHEY_SIMPLEX, 0.7, paper_color, 2)
                         
                         vis_frame = cv2.resize(vis_frame, (config.CAMERA_DISPLAY_WIDTH, config.CAMERA_DISPLAY_HEIGHT))
                         _, jpg = cv2.imencode('.jpg', vis_frame, [int(cv2.IMWRITE_JPEG_QUALITY), config.RESULT_JPEG_QUALITY])
@@ -377,6 +458,103 @@ class YOLOWorker(Process):
                     'ts': ts,
                     'raw_detected': person_detected
                 }
+
+                # Encode clean frame for production capture (no overlays)
+                if config.PRODUCTION_CAPTURE_ENABLED:
+                    try:
+                        clean_frame_resized = cv2.resize(frame, (config.CAMERA_DISPLAY_WIDTH, config.CAMERA_DISPLAY_HEIGHT))
+                        _, clean_jpg = cv2.imencode('.jpg', clean_frame_resized, [int(cv2.IMWRITE_JPEG_QUALITY), config.RESULT_JPEG_QUALITY])
+                        result_data['original_frame_jpeg'] = clean_jpg.tobytes()
+                    except Exception as e:
+                        logger.error(f"[{self.machine_id}] Failed to encode original frame: {e}")
+                
+                # Detect Roll clamp (white/gray metal)
+                roll_clamp_detected = False
+                if config.ENABLE_ROLL_CLAMP_DETECTION:
+                    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+                    gray_bgr = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    
+                    # Detect white/light gray metal (high brightness, low saturation)
+                    lower_metal = np.array([0, 0, 180])  # Low saturation, high value
+                    upper_metal = np.array([180, 50, 255])  # Any hue, low saturation, high brightness
+                    mask_metal = cv2.inRange(hsv, lower_metal, upper_metal)
+                    
+                    # Additional gray metal detection (medium brightness)
+                    _, gray_mask = cv2.threshold(gray_bgr, 150, 255, cv2.THRESH_BINARY)
+                    
+                    # Combine masks
+                    mask_combined = cv2.bitwise_or(mask_metal, gray_mask)
+                    metal_pixels = cv2.countNonZero(mask_combined)
+                    total_pixels = frame.shape[0] * frame.shape[1]
+                    metal_ratio = metal_pixels / total_pixels
+                    
+                    roll_clamp_detected = metal_ratio > config.ROLL_CLAMP_METAL_GRAY_THRESHOLD
+                    if roll_clamp_detected:
+                        logger.warning(f"[{self.machine_id}] ROLL CLAMP DETECTED! Metal ratio: {metal_ratio:.3f}")
+                    
+                    # Check if Roll clamp was released (from detected → not detected)
+                    if self.last_roll_clamp_detected and not roll_clamp_detected:
+                        self.roll_clamp_released_time = time.time()
+                        self.auto_start_triggered = False
+                        logger.warning(f"[{self.machine_id}] 🚨 ROLL CLAMP RELEASED! Starting {self.auto_start_delay_seconds}s delay timer for auto start")
+                    
+                    # Reset countdown if Roll clamp is detected again (forklift returns)
+                    if roll_clamp_detected and self.roll_clamp_released_time is not None:
+                        logger.warning(f"[{self.machine_id}] ⚠️ Roll Clamp detected again - Resetting auto start countdown")
+                        self.roll_clamp_released_time = None
+                        self.auto_start_triggered = False
+                    
+                    # Check if we need to trigger auto start
+                    if self.roll_clamp_released_time is not None and not self.auto_start_triggered:
+                        elapsed = time.time() - self.roll_clamp_released_time
+                        if elapsed >= self.auto_start_delay_seconds:
+                            # Check if no person is detected in ROI before triggering
+                            if not final_detected:
+                                self.auto_start_triggered = True
+                                logger.warning(f"[{self.machine_id}]  AUTO START TRIGGERED! (after {elapsed:.1f}s delay, no person detected)")
+                                result_data['auto_start_signal'] = True
+                            else:
+                                logger.warning(f"[{self.machine_id}]  AUTO START DELAYED - Person detected in ROI! (elapsed: {elapsed:.1f}s)")
+                                # Reset timer to wait for person to leave
+                                self.roll_clamp_released_time = time.time()
+                        else:
+                            remaining = self.auto_start_delay_seconds - elapsed
+                            logger.info(f"[{self.machine_id}] Auto start countdown: {remaining:.1f}s remaining")
+                    
+                    self.last_roll_clamp_detected = roll_clamp_detected
+                    result_data['roll_clamp_detected'] = roll_clamp_detected
+                    result_data['auto_start_countdown'] = (
+                        self.auto_start_delay_seconds - (time.time() - self.roll_clamp_released_time)
+                        if self.roll_clamp_released_time and not self.auto_start_triggered
+                        else None
+                    )
+
+                
+                # Detect paper roll (white/cream/brown)
+                if config.ENABLE_PAPER_ROLL_DETECTION:
+                    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+                    
+                    # White detection
+                    lower_white = np.array([0, 0, 200])
+                    upper_white = np.array([180, 25, 255])
+                    mask_white = cv2.inRange(hsv, lower_white, upper_white)
+                    
+                    # Cream/Brown detection
+                    lower_brown = np.array([10, 30, 100])
+                    upper_brown = np.array([40, 200, 255])
+                    mask_brown = cv2.inRange(hsv, lower_brown, upper_brown)
+                    
+                    # Combine masks
+                    mask_combined = cv2.bitwise_or(mask_white, mask_brown)
+                    paper_pixels = cv2.countNonZero(mask_combined)
+                    total_pixels = frame.shape[0] * frame.shape[1]
+                    paper_ratio = paper_pixels / total_pixels
+                    
+                    paper_roll_detected = paper_ratio > config.PAPER_ROLL_COLOR_RATIO_THRESHOLD
+                    if paper_roll_detected:
+                        logger.warning(f"[{self.machine_id}] PAPER ROLL DETECTED! Color ratio: {paper_ratio:.3f}")
+                    
+                    result_data['paper_roll_detected'] = paper_roll_detected
                 
                 # Attach frame if needed
                 if config.USE_RESULT_FRAME:
@@ -398,6 +576,28 @@ class YOLOWorker(Process):
                     status_text = f"Person: {final_detected} (raw:{person_detected}) [{detection_sum}/{len(self.detection_history)}]"
                     cv2.putText(vis_frame, status_text, (10, 30), 
                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0) if final_detected else (255, 255, 255), 2)
+                    
+                    # Display Roll Clamp status
+                    if config.ENABLE_ROLL_CLAMP_DETECTION:
+                        clamp_status = "CLAMP: YES" if result_data.get('roll_clamp_detected', False) else "CLAMP: NO"
+                        clamp_color = (0, 255, 255) if result_data.get('roll_clamp_detected', False) else (128, 128, 128)
+                        cv2.putText(vis_frame, clamp_status, (10, 60), 
+                                  cv2.FONT_HERSHEY_SIMPLEX, 0.6, clamp_color, 2)
+                        
+                        # Display countdown if active
+                        countdown = result_data.get('auto_start_countdown', None)
+                        if countdown is not None and countdown > 0:
+                            countdown_text = f"Auto Start in: {countdown:.0f}s"
+                            cv2.putText(vis_frame, countdown_text, (10, 85), 
+                                      cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                    
+                    # Display Paper Roll status
+                    if config.ENABLE_PAPER_ROLL_DETECTION:
+                        paper_status = "PAPER ROLL: YES" if result_data.get('paper_roll_detected', False) else "PAPER ROLL: NO"
+                        paper_color = (255, 255, 0) if result_data.get('paper_roll_detected', False) else (128, 128, 128)
+                        y_pos = 110 if result_data.get('auto_start_countdown', None) is not None else 85
+                        cv2.putText(vis_frame, paper_status, (10, y_pos), 
+                                  cv2.FONT_HERSHEY_SIMPLEX, 0.6, paper_color, 2)
                     
                     vis_frame = cv2.resize(vis_frame, (config.CAMERA_DISPLAY_WIDTH, config.CAMERA_DISPLAY_HEIGHT))
                     

@@ -60,10 +60,19 @@ ENABLE_DETECTION_ON_DI = True  # Only detect when specific DI is ON
 DETECTION_ENABLE_DI_ADDR_A = 0  # Machine A: Check_roll (addr 0)
 DETECTION_ENABLE_DI_ADDR_B = 8  # Machine B: Check_roll (addr 8)
 
+# Roll Clamp Detection (using white/gray metal color detection)
+ENABLE_ROLL_CLAMP_DETECTION = True
+ROLL_CLAMP_METAL_GRAY_THRESHOLD = 0.05  # 5% gray/white metal pixels = clamp detected
+ROLL_CLAMP_AUTO_START_DELAY = 180  # seconds (3 minutes) - delay after clamp release before auto start
+
+# Paper Roll Detection (using white/cream/brown color detection)
+ENABLE_PAPER_ROLL_DETECTION = True
+PAPER_ROLL_COLOR_RATIO_THRESHOLD = 0.3  # 30% white/cream/brown pixels = paper roll detected
+
 # Temporal Smoothing
 USE_TEMPORAL_SMOOTHING = False
 DETECTION_MEMORY_FRAMES = 10
-MIN_DETECTIONS_FOR_ALARM = 1  
+MIN_DETECTIONS_FOR_ALARM = 1 
 
 # Visualization
 DRAW_OVERLAY = True

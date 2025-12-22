@@ -23,8 +23,14 @@ class MachineState:
     person_count: int = 0
     detection_timestamp: float = 0.0
     
+    # Roll Clamp & Paper Roll Detection
+    roll_clamp_detected: bool = False
+    paper_roll_detected: bool = False
+    auto_start_countdown: Optional[float] = None
+    
     # Capture
     last_captured_frame: Optional[bytes] = None
+    last_original_frame: Optional[bytes] = None
     last_captured_timestamp: Optional[str] = None
     last_captured_path: Optional[str] = None
     
@@ -89,6 +95,9 @@ class MachineLogicWorker(Process):
         # Legacy tracking
         self.prev_green_finish = False
         
+        # Delayed capture
+        self.roll_capture_pending_time = None
+        
         # Load config values
         self.auto_stop_enabled = config.get('AUTO_STOP_ON_PERSON', True)
         self.auto_stop_cooldown = config.get('STOP_COOLDOWN_SEC', 3.0)
@@ -150,9 +159,21 @@ class MachineLogicWorker(Process):
                 self.state.person_count = result.get('person_count', 0)
                 self.state.detection_timestamp = result.get('ts', time.time())
                 
+                # Roll Clamp & Paper Roll Detection
+                self.state.roll_clamp_detected = result.get('roll_clamp_detected', False)
+                self.state.paper_roll_detected = result.get('paper_roll_detected', False)
+                self.state.auto_start_countdown = result.get('auto_start_countdown', None)
+                
+                # Handle Auto Start Signal
+                if result.get('auto_start_signal', False):
+                    self._handle_auto_start()
+                
                 # Handle capture if available
                 if 'frame_jpeg' in result:
                     self.state.last_captured_frame = result['frame_jpeg']
+                
+                if 'original_frame_jpeg' in result:
+                    self.state.last_original_frame = result['original_frame_jpeg']
                     
         except Empty:
             pass
@@ -310,6 +331,51 @@ class MachineLogicWorker(Process):
         """Trigger error alarm"""
         pass
     
+    def _handle_auto_start(self):
+        """Handle auto start signal from Roll clamp release"""
+        
+        # Check machine state before auto start
+        if self.machine_id == 'A':
+            machine_ready = self.state.di_values.get(5, False)
+            machine_running = self.state.di_values.get(4, False)
+            check_roll = self.state.di_values.get(0, False)
+        elif self.machine_id == 'B':
+            machine_ready = self.state.di_values.get(13, False)
+            machine_running = self.state.di_values.get(12, False)
+            check_roll = self.state.di_values.get(8, False)
+        else:
+            logger.error(f"[{self.machine_id}] Unknown machine ID - Auto start cancelled")
+            return
+        
+        # Validate machine state
+        if not machine_ready:
+            logger.warning(f"[{self.machine_id}]  Auto start cancelled - Machine not ready")
+            return
+        
+        if machine_running:
+            logger.warning(f"[{self.machine_id}]  Auto start cancelled - Machine already running")
+            return
+        
+        if not check_roll:
+            logger.warning(f"[{self.machine_id}]  Auto start cancelled - No roll detected")
+            return
+        
+        # All conditions met - trigger auto start
+        logger.warning(f"[{self.machine_id}]  AUTO START triggered by Roll clamp release!")
+        
+        # Send START command (Pulse DO 0)
+        self._write_modbus_do(0, True)
+        time.sleep(0.3)
+        self._write_modbus_do(0, False)
+        
+        self._log_event('AUTO_START', {
+            'reason': 'Roll clamp released (3 min delay elapsed)',
+            'timestamp': datetime.now().isoformat(),
+            'machine_ready': machine_ready,
+            'machine_running': machine_running,
+            'check_roll': check_roll
+        })
+    
     def _on_person_enter_roi(self):
         """Handle person entering ROI"""
         pass
@@ -346,7 +412,15 @@ class MachineLogicWorker(Process):
         """Execute core machine logic"""
         self._update_machine_status()
         self._check_safety_rules()
+        self._check_pending_captures()
         self._check_production_status()
+
+    def _check_pending_captures(self):
+        """Check and execute pending delayed captures"""
+        if self.roll_capture_pending_time and time.time() >= self.roll_capture_pending_time:
+            self.roll_capture_pending_time = None
+            logger.info(f"[{self.machine_id}] Executing delayed roll capture (5s after detection)")
+            self._capture_production_image('ROLL_DETECTED')
 
     def _get_last_unfinished_roll(self):
         """Get last unfinished roll from database for state recovery"""
@@ -462,28 +536,28 @@ class MachineLogicWorker(Process):
             if check_roll_current:
                 # ตรวจสอบว่าไม่ได้อยู่ในสถานะรอยกออก (ป้องกันการนับซ้ำ)
                 if not self.is_waiting_for_removal:
-                    logger.info(f"[{self.machine_id}] 🟢 WRAP START (Roll detected)")
+                    logger.info(f"[{self.machine_id}]  WRAP START (Roll detected)")
                     self._on_wrapping_started()
                     self._write_modbus_do(blue_run, True)
                     self._write_modbus_do(green_finish, False)
                     self.is_waiting_for_removal = False
                 else:
-                    logger.warning(f"[{self.machine_id}] ⚠️ Wrapping started but still waiting for previous roll removal - IGNORED")
+                    logger.warning(f"[{self.machine_id}]  Wrapping started but still waiting for previous roll removal - IGNORED")
             else:
-                logger.warning(f"[{self.machine_id}] ⚠️ Wrapping started but NO ROLL detected - IGNORED")
+                logger.warning(f"[{self.machine_id}]  Wrapping started but NO ROLL detected - IGNORED")
 
         # ========== DETECT WRAPPING STOP: wrapping ON -> OFF ==========
         elif not current_wrapping and self.prev_wrapping_status:
             # ต้องมีการเริ่มงานก่อน (wrapping_start_time ไม่เป็น None)
             if self.wrapping_start_time is not None:
-                logger.info(f"[{self.machine_id}] 🟡 WRAPPING STOPPED (Waiting for roll removal)")
+                logger.info(f"[{self.machine_id}]  WRAPPING STOPPED (Waiting for roll removal)")
                 self._write_modbus_do(blue_run, False)
                 # ยังไม่จบงาน รอคนยกออกก่อน
                 self.is_waiting_for_removal = True
                 self._write_modbus_do(green_finish, True)
                 self.removal_wait_start_time = time.time()  # เริ่มจับเวลารอ
             else:
-                logger.warning(f"[{self.machine_id}] ⚠️ Wrapping stopped but no start time - IGNORED")
+                logger.warning(f"[{self.machine_id}]  Wrapping stopped but no start time - IGNORED")
 
         # ========== DETECT REMOVAL: Roll ON -> OFF ==========
         # เช็คว่าพันเสร็จแล้ว (is_waiting_for_removal) และของถูกยกออก (check_roll OFF)
@@ -492,7 +566,7 @@ class MachineLogicWorker(Process):
             if self.removal_wait_start_time is not None:
                 wait_duration = time.time() - self.removal_wait_start_time
                 if wait_duration > 300:  # 5 minutes timeout
-                    logger.warning(f"[{self.machine_id}] ⏰ TIMEOUT: Waited {wait_duration:.0f}s for roll removal - Force completing")
+                    logger.warning(f"[{self.machine_id}]  TIMEOUT: Waited {wait_duration:.0f}s for roll removal - Force completing")
                     self._on_wrapping_finished()
                     self._write_modbus_do(green_finish, False)
                     self.is_waiting_for_removal = False
@@ -500,7 +574,7 @@ class MachineLogicWorker(Process):
             
             # ตรวจจับการยก Roll ออก (Edge: ON -> OFF)
             if not check_roll_current and self.prev_check_roll_status:
-                logger.info(f"[{self.machine_id}] 🔴 COMPLETE (Roll removed)")
+                logger.info(f"[{self.machine_id}]  COMPLETE (Roll removed)")
                 self._on_wrapping_finished()
                 self._write_modbus_do(green_finish, False)
                 self.is_waiting_for_removal = False
@@ -508,11 +582,17 @@ class MachineLogicWorker(Process):
 
         # ========== EDGE CASE: Roll placed while waiting ==========
         if self.is_waiting_for_removal and not self.prev_check_roll_status and check_roll_current:
-            logger.warning(f"[{self.machine_id}] ⚠️ ABNORMAL: New roll placed while waiting for removal!")
+            logger.warning(f"[{self.machine_id}]  ABNORMAL: New roll placed while waiting for removal!")
             # อาจเป็นการวาง Roll ใหม่ ให้รีเซ็ตสถานะ
             # แต่ไม่นับเป็นงานเสร็จ
 
         # Update Previous State (ต้องอยู่ท้ายสุดเสมอ)
+        
+        # Detect Roll Rising Edge for Capture (Check Roll ON)
+        if check_roll_current and not self.prev_check_roll_status:
+             logger.info(f"[{self.machine_id}] Roll Detected -> Scheduling capture in 5s")
+             self.roll_capture_pending_time = time.time() + 5.0
+
         self.prev_wrapping_status = current_wrapping
         self.prev_check_roll_status = check_roll_current
 
@@ -525,7 +605,13 @@ class MachineLogicWorker(Process):
         Returns:
             Path to saved image or None
         """
-        if not self.production_capture_enabled or not self.state.last_captured_frame:
+        if not self.production_capture_enabled:
+            return None
+            
+        # Use original frame if available (clean image), otherwise fallback to processed frame
+        frame_to_save = self.state.last_original_frame if self.state.last_original_frame else self.state.last_captured_frame
+        
+        if not frame_to_save:
             return None
             
         try:
@@ -545,7 +631,7 @@ class MachineLogicWorker(Process):
             
             # Save image
             with open(filepath, 'wb') as f:
-                f.write(self.state.last_captured_frame)
+                f.write(frame_to_save)
             
             logger.info(f"[{self.machine_id}] Production image captured: {filepath}")
             return str(filepath)
@@ -560,7 +646,7 @@ class MachineLogicWorker(Process):
         self.wrapping_start_time = timestamp
         
         logger.info(
-            f"[{self.machine_id}] 🟢 WRAPPING STARTED "
+            f"[{self.machine_id}]  WRAPPING STARTED "
             f"(DI addr {4 if self.machine_id == 'A' else 12} = ON)"
         )
         
@@ -589,7 +675,7 @@ class MachineLogicWorker(Process):
         duration_min = duration_sec / 60.0
         
         logger.info(
-            f"[{self.machine_id}] 🔴 WRAPPING FINISHED "
+            f"[{self.machine_id}]  WRAPPING FINISHED "
             f"(DI addr {4 if self.machine_id == 'A' else 12} = OFF) "
             f"Duration: {duration_min:.2f} min"
         )

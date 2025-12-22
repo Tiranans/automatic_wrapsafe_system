@@ -2,6 +2,7 @@
 
 import { useState, useEffect } from "react";
 import { Printer, FileText, ArrowLeft } from "lucide-react";
+import { AgCharts } from "ag-charts-react";
 
 type ReportType = "daily" | "weekly" | "monthly" | "yearly";
 
@@ -15,7 +16,6 @@ interface ProductionDetail {
   duration_seconds: number;
   duration_minutes: number;
   pieces_completed: number;
-  film_wrap_cycle: number;
   note: string | null;
 }
 
@@ -67,6 +67,12 @@ export default function ReportPage() {
   const [images, setImages] = useState<ProductionImage[]>([]);
   const [loading, setLoading] = useState(false);
   const [currentTime, setCurrentTime] = useState<string>('');
+
+  // Chart options state
+  const [dailyChartOptions, setDailyChartOptions] = useState<any>(null);
+  const [weeklyChartOptions, setWeeklyChartOptions] = useState<any>(null);
+  const [monthlyChartOptions, setMonthlyChartOptions] = useState<any>(null);
+  const [yearlyChartOptions, setYearlyChartOptions] = useState<any>(null);
 
   function getWeekStart(date: Date): Date {
     const d = new Date(date);
@@ -202,6 +208,179 @@ export default function ReportPage() {
     fetchReport();
   }, [reportType, selectedDate, selectedYear, selectedMonth, selectedWeekStart]);
 
+  // Build chart data/options when data changes
+  useEffect(() => {
+    // Daily: build bar chart showing rolls per shift
+    if (reportType === "daily") {
+      // Aggregate rolls by shift
+      const shiftMap: Record<string, { shift: string; A: number; B: number }> = {};
+
+      // Process Machine A data
+      detailsA.forEach((log) => {
+        if (log.end_datetime) {
+          if (!shiftMap[log.shift_name]) {
+            shiftMap[log.shift_name] = { shift: log.shift_name, A: 0, B: 0 };
+          }
+          shiftMap[log.shift_name].A += 1;
+        }
+      });
+
+      // Process Machine B data
+      detailsB.forEach((log) => {
+        if (log.end_datetime) {
+          if (!shiftMap[log.shift_name]) {
+            shiftMap[log.shift_name] = { shift: log.shift_name, A: 0, B: 0 };
+          }
+          shiftMap[log.shift_name].B += 1;
+        }
+      });
+
+      const data = Object.values(shiftMap);
+
+      if (data.length > 0) {
+        setDailyChartOptions({
+          // title: { text: "Daily Chart (Shift)" },
+          data,
+          axes: [
+            {
+              type: "category",
+              position: "bottom",
+              title: { text: "Shift" }
+            },
+            {
+              type: "number",
+              position: "left",
+              title: { text: "Rolls" }
+            }
+          ],
+          series: [
+            {
+              type: "bar",
+              xKey: "shift",
+              yKey: "A",
+              yName: "Machine A",
+              fill: "#1d4ed8",
+              stroke: "#1d4ed8"
+            },
+            {
+              type: "bar",
+              xKey: "shift",
+              yKey: "B",
+              yName: "Machine B",
+              fill: "#16a34a",
+              stroke: "#16a34a"
+            }
+          ],
+          legend: { position: "bottom" }
+        });
+      } else {
+        setDailyChartOptions(null);
+      }
+    } else {
+      setDailyChartOptions(null);
+    }
+
+    // Weekly: build daily chart for 7 days
+    if (reportType === "weekly") {
+      // Aggregate daily rolls from details arrays
+      const dayMap: Record<string, { A: number; B: number }> = {};
+      for (let i = 0; i < 7; i++) {
+        const d = new Date(selectedWeekStart);
+        d.setDate(d.getDate() + i);
+        const ds = d.toISOString().split("T")[0];
+        dayMap[ds] = dayMap[ds] || { A: 0, B: 0 };
+      }
+      detailsA.forEach((log) => {
+        const date = log.start_datetime.split(" ")[0];
+        if (dayMap[date]) {
+          if (log.end_datetime) dayMap[date].A += 1;
+        }
+      });
+      detailsB.forEach((log) => {
+        const date = log.start_datetime.split(" ")[0];
+        if (dayMap[date]) {
+          if (log.end_datetime) dayMap[date].B += 1;
+        }
+      });
+
+      const data = Object.keys(dayMap).map((date) => ({
+        date: new Date(date),
+        A: dayMap[date].A,
+        B: dayMap[date].B,
+        Total: dayMap[date].A + dayMap[date].B,
+      }));
+
+      setWeeklyChartOptions({
+        // title: { text: "Weekly Chart (Daily Rolls)" },
+        data,
+        axes: [
+          { type: "time", position: "bottom", title: { text: "Date" }, label: { format: "%d/%m" } },
+          { type: "number", position: "left", title: { text: "Rolls" } }
+        ],
+        series: [
+          { type: "bar", xKey: "date", yKey: "A", yName: "Machine A", fill: "#1d4ed8", stroke: "#1d4ed8" },
+          { type: "bar", xKey: "date", yKey: "B", yName: "Machine B", fill: "#16a34a", stroke: "#16a34a" },
+          { type: "bar", xKey: "date", yKey: "Total", yName: "Total", fill: "#ea580c", stroke: "#ea580c" }
+        ],
+        legend: { position: "bottom" }
+      });
+    } else {
+      setWeeklyChartOptions(null);
+    }
+
+    // Monthly: use summary.daily_data (each day in month)
+    if (reportType === "monthly" && summary?.daily_data?.length) {
+      const data = summary.daily_data.map((day: any) => ({
+        date: new Date(day.date),
+        A: day.machines?.A?.rolls || 0,
+        B: day.machines?.B?.rolls || 0,
+        Total: (day.machines?.A?.rolls || 0) + (day.machines?.B?.rolls || 0),
+      }));
+      setMonthlyChartOptions({
+        // title: { text: "Monthly Chart (Daily Rolls)" },
+        data,
+        axes: [
+          { type: "time", position: "bottom", title: { text: "Date" }, label: { format: "%d/%m" } },
+          { type: "number", position: "left", title: { text: "Rolls" } }
+        ],
+        series: [
+          { type: "bar", xKey: "date", yKey: "A", yName: "Machine A", fill: "#1d4ed8", stroke: "#1d4ed8" },
+          { type: "bar", xKey: "date", yKey: "B", yName: "Machine B", fill: "#16a34a", stroke: "#16a34a" },
+          { type: "bar", xKey: "date", yKey: "Total", yName: "Total", fill: "#ea580c", stroke: "#ea580c" }
+        ],
+        legend: { position: "bottom" }
+      });
+    } else {
+      setMonthlyChartOptions(null);
+    }
+
+    // Yearly: use summary.monthly_data (each month in year)
+    if (reportType === "yearly" && summary?.monthly_data?.length) {
+      const data = summary.monthly_data.map((m: any) => ({
+        month: new Date(selectedYear, m.month - 1, 1),
+        A: m.machines?.A?.rolls || 0,
+        B: m.machines?.B?.rolls || 0,
+        Total: (m.machines?.A?.rolls || 0) + (m.machines?.B?.rolls || 0),
+      }));
+      setYearlyChartOptions({
+        // title: { text: "Yearly Chart (Monthly Rolls)" },
+        data,
+        axes: [
+          { type: "time", position: "bottom", title: { text: "Month" }, label: { format: "%b" } },
+          { type: "number", position: "left", title: { text: "Rolls" } }
+        ],
+        series: [
+          { type: "bar", xKey: "month", yKey: "A", yName: "Machine A", fill: "#1d4ed8", stroke: "#1d4ed8" },
+          { type: "bar", xKey: "month", yKey: "B", yName: "Machine B", fill: "#16a34a", stroke: "#16a34a" },
+          { type: "bar", xKey: "month", yKey: "Total", yName: "Total", fill: "#ea580c", stroke: "#ea580c" }
+        ],
+        legend: { position: "bottom" }
+      });
+    } else {
+      setYearlyChartOptions(null);
+    }
+  }, [reportType, summary, detailsA, detailsB, selectedWeekStart, selectedYear, selectedDate]);
+
   const handlePrint = () => {
     window.print();
   };
@@ -230,8 +409,7 @@ export default function ReportPage() {
         {/* Header */}
         <header className="mb-8 flex items-center justify-between print:mb-4">
           <div className="flex items-center gap-3">
-            <a
-              href="/"
+            <a href="/"
               className="bg-gray-200 p-2 rounded-lg text-gray-700 hover:bg-gray-300 transition print:hidden"
             >
               <ArrowLeft size={24} />
@@ -528,10 +706,50 @@ export default function ReportPage() {
               </div>
             )}
 
+            {/* Daily Report chart */}
+            {(reportType === "daily") && dailyChartOptions && (
+              <div className="bg-white rounded-lg shadow-sm overflow-hidden">
+                <div className="p-6">
+                  <h4 className="text-lg font-bold text-gray-900 mb-2">Daily Production by Shift</h4>
+                  <AgCharts options={dailyChartOptions} />
+                </div>
+              </div>
+            )}
+
+            {/* Weekly Report chart */}
+            {(reportType === "weekly") && weeklyChartOptions && (
+              <div className="bg-white rounded-lg shadow-sm overflow-hidden">
+                <div className="p-6 border-t">
+                  <h4 className="text-lg font-bold text-gray-900 mb-2">Weekly Chart (Daily Rolls)</h4>
+                  <AgCharts options={weeklyChartOptions} />
+                </div>
+              </div>
+            )}
+
+            {/* Monthly Report chart */}
+            {(reportType === "monthly") && monthlyChartOptions && (
+              <div className="bg-white rounded-lg shadow-sm overflow-hidden">
+                <div className="p-6 border-t">
+                  <h4 className="text-lg font-bold text-gray-900 mb-2">Monthly Chart (Daily Rolls)</h4>
+                  <AgCharts options={monthlyChartOptions} />
+                </div>
+              </div>
+            )}
+
+            {/* Yearly Report chart */}
+            {(reportType === "yearly") && yearlyChartOptions && (
+              <div className="bg-white rounded-lg shadow-sm overflow-hidden">
+                <div className="p-6 border-t">
+                  <h4 className="text-lg font-bold text-gray-900 mb-2">Yearly Chart (Monthly Rolls)</h4>
+                  <AgCharts options={yearlyChartOptions} />
+                </div>
+              </div>
+            )}
+
             {/* Production Images */}
             {reportType === "daily" && images.length > 0 && (
               <div className="bg-white rounded-lg shadow-sm p-6">
-                <h3 className="text-xl font-bold text-gray-900 mb-4">Production Images</h3>
+                {/* <h3 className="text-xl font-bold text-gray-900 mb-4">Production Images</h3> */}
                 <div className="grid md:grid-cols-4 gap-4">
                   {/* {images.map((img, idx) => (
                     <div key={idx} className="border border-gray-200 rounded-lg p-3">
