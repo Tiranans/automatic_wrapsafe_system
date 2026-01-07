@@ -10,7 +10,6 @@ import cv2
 import traceback 
 from collections import deque
 from queue import Empty
-import config
 
 logger = setup_logger('YOLOWorker')
 
@@ -68,6 +67,14 @@ class YOLOWorker(Process):
         self.roll_clamp_released_time = None
         self.auto_start_delay_seconds = 180  # 3 minutes = 180 seconds
         self.auto_start_triggered = False
+        
+        # OBB Clamp Detection State
+        self.obb_frame_count = 0
+        self.last_clamp_detected = False
+        self.last_clamp_confidence = 0.0
+        self.last_clamp_bbox = None
+        self.last_clamp_angle = None
+        self.last_paper_roll_detected = False  # Added persistence for paper roll
         
         logger.info(f"[{self.machine_id}] Frame skip config: base={self.base_skip}, no_person={self.skip_when_no_person}, person={self.skip_when_person}")
 
@@ -155,24 +162,73 @@ class YOLOWorker(Process):
                 logger.error(f"[{self.machine_id}] Failed to connect to shared memory: {e}")
                 self.shared_frame = None
 
+    def _detect_roll_clamp(self, frame, obb_results=None) -> bool:
+        """Detect Roll clamp using OBB results (Class 0: forklift_clamp)"""
+        if not config.ENABLE_ROLL_CLAMP_DETECTION:
+            return False
+            
+        if obb_results is not None:
+            if hasattr(obb_results, 'obb') and obb_results.obb is not None and len(obb_results.obb) > 0:
+                obb_data = obb_results.obb
+                if hasattr(obb_data, 'cls') and obb_data.cls is not None:
+                    class_ids = obb_data.cls.cpu().numpy().astype(int)
+                    confs = obb_data.conf.cpu().numpy()
+                    
+                    # Check for class 0 (forklift_clamp) with high confidence
+                    for idx, (cid, conf) in enumerate(zip(class_ids, confs)):
+                        if cid == config.OBB_CLAMP_CLASS_ID and conf >= config.CLAMP_PRESENT_THRESHOLD:
+                            logger.warning(f"[{self.machine_id}] ROLL CLAMP DETECTED via OBB Model! (conf={conf:.2f})")
+                            return True
+        return False
+
+    def _detect_paper_roll(self, frame, obb_results=None) -> bool:
+        """Detect paper roll using OBB results (Class 1 or 2)"""
+        if not config.ENABLE_PAPER_ROLL_DETECTION:
+            return False
+
+        if obb_results is not None:
+            if hasattr(obb_results, 'obb') and obb_results.obb is not None and len(obb_results.obb) > 0:
+                obb_data = obb_results.obb
+                if hasattr(obb_data, 'cls') and obb_data.cls is not None:
+                    class_ids = obb_data.cls.cpu().numpy().astype(int)
+                    # Class 1: paper_roll_small, Class 2: paper_roll_big
+                    if any(cid in [1, 2] for cid in class_ids):
+                        logger.warning(f"[{self.machine_id}] PAPER ROLL DETECTED via OBB Model!")
+                        return True
+        return False
+
     def run(self):
         """Main worker loop"""
         logger.info(f"[{self.machine_id}] YOLO Worker started - PID={self.pid}")
         self.running = True
         
-        # Load model with retry
+        # Load Pose model with retry
         model = None
         while self.running and model is None:
             try:
                 model = YOLO(config.YOLO_MODEL_PATH)
-                logger.info(f"[{self.machine_id}] YOLO model loaded: {config.YOLO_MODEL_PATH}")
+                logger.info(f"[{self.machine_id}] YOLO Pose model loaded: {config.YOLO_MODEL_PATH}")
                 is_pose_model = 'pose' in config.YOLO_MODEL_PATH.lower()
             except Exception as e:
-                logger.error(f"[{self.machine_id}] Failed to load YOLO model: {e}")
+                logger.error(f"[{self.machine_id}] Failed to load YOLO Pose model: {e}")
                 time.sleep(5)
         
         if not self.running:
             return
+        
+        # Load OBB model if enabled
+        obb_model = None
+        if config.ENABLE_OBB_CLAMP_DETECTION:
+            while self.running and obb_model is None:
+                try:
+                    obb_model = YOLO(config.YOLO_OBB_MODEL_PATH)
+                    logger.info(f"[{self.machine_id}] YOLO OBB model loaded: {config.YOLO_OBB_MODEL_PATH}")
+                except Exception as e:
+                    logger.error(f"[{self.machine_id}] Failed to load YOLO OBB model: {e}")
+                    time.sleep(5)
+            
+            if not self.running:
+                return
 
         self._connect_shared_memory()
         
@@ -226,7 +282,7 @@ class YOLOWorker(Process):
 
                 # Check if detection is enabled via DI
                 di_detection_disabled = False
-                print(f"[{self.machine_id}] DI Enabled: {self.di_enabled}")
+                logger.debug(f"[{self.machine_id}] DI Enabled: {self.di_enabled}")
                 if config.ENABLE_DETECTION_ON_DI :
                     if not self.di_enabled:
                         di_detection_disabled = True
@@ -237,69 +293,10 @@ class YOLOWorker(Process):
                         'person_in_roi': False,
                         'person_count': 0,
                         'ts': ts,
-                        'raw_detected': False
+                        'raw_detected': False,
+                        'roll_clamp_detected': False,
+                        'paper_roll_detected': False
                     }
-
-                    # Detect Roll clamp (white/gray metal)
-                    if config.ENABLE_ROLL_CLAMP_DETECTION:
-                        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-                        gray_bgr = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                        
-                        # Detect white/light gray metal (high brightness, low saturation)
-                        lower_metal = np.array([0, 0, 180])  # Low saturation, high value
-                        upper_metal = np.array([180, 50, 255])  # Any hue, low saturation, high brightness
-                        mask_metal = cv2.inRange(hsv, lower_metal, upper_metal)
-                        
-                        # Additional gray metal detection (medium brightness)
-                        _, gray_mask = cv2.threshold(gray_bgr, 150, 255, cv2.THRESH_BINARY)
-                        
-                        # Combine masks
-                        mask_combined = cv2.bitwise_or(mask_metal, gray_mask)
-                        metal_pixels = cv2.countNonZero(mask_combined)
-                        total_pixels = frame.shape[0] * frame.shape[1]
-                        metal_ratio = metal_pixels / total_pixels
-                        
-                        roll_clamp_detected = metal_ratio > config.ROLL_CLAMP_METAL_GRAY_THRESHOLD
-                        if roll_clamp_detected:
-                            logger.warning(f"[{self.machine_id}] ROLL CLAMP DETECTED! Metal ratio: {metal_ratio:.3f}")
-                        
-                        result_data['roll_clamp_detected'] = roll_clamp_detected
-
-                    
-                    # Detest paper roll
-                    if config.ENABLE_PAPER_ROLL_DETECTION:
-                        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-
-                        # === 1. การกำหนดช่วงสี ===
-    
-                        # 1.1 ช่วงสีขาว (White Thresholding) - เหมือนเดิม
-                        lower_white = np.array([0, 0, 200])
-                        upper_white = np.array([180, 25, 255])
-                        
-                        # 1.2 ช่วงสีน้ำตาล (Brown Thresholding) - ค่าตัวอย่างที่ปรับจูน
-                        # Hue: 10-40 (ส้ม-เหลือง)
-                        # Saturation: 50-255 (อิ่มตัวปานกลาง-สูง)
-                        # Value: 50-200 (ความสว่างปานกลาง-ต่ำ)
-                        lower_brown = np.array([10, 50, 50])
-                        upper_brown = np.array([40, 255, 200])
-
-                        # สร้างมาสก์สำหรับสีขาว
-                        mask_white = cv2.inRange(hsv, lower_white, upper_white)
-                        
-                        mask_brown = cv2.inRange(hsv, lower_brown, upper_brown)
-
-                        mask_combined = cv2.bitwise_or(mask_white, mask_brown)
-                        combined_pixels = cv2.countNonZero(mask_combined)
-                        total_pixels = frame.shape[0] * frame.shape[1]
-                        
-                        combined_ratio = combined_pixels / total_pixels
-
-                        paper_roll_detected = combined_ratio > config.PAPER_ROLL_COLOR_RATIO_THRESHOLD 
-
-                        if paper_roll_detected:
-                            logger.warning(f"[{self.machine_id}] PAPER ROLL DETECTED! White ratio: {combined_ratio:.3f}")
-                        
-                        result_data['paper_roll_detected'] = paper_roll_detected
 
                     # Still send frame for web display
                     if config.USE_RESULT_FRAME:
@@ -308,7 +305,7 @@ class YOLOWorker(Process):
                         if config.DRAW_ROI:
                             rx1, ry1, rx2, ry2 = self.roi_pixels.astype(int)
                             cv2.rectangle(vis_frame, (rx1, ry1), (rx2, ry2), (128, 128, 128), 2)
-                            cv2.putText(vis_frame, "DETECTION DISABLED", (10, 30), 
+                            cv2.putText(vis_frame, "DETECTION DISABLED", (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                         
                         # Display Roll Clamp status
@@ -347,7 +344,7 @@ class YOLOWorker(Process):
                 
                 # Inference
                 if should_infer:
-                    # logger.info(f"[{self.machine_id}] 🔍 Running YOLO inference on frame {self.frame_count} (skip={self.adaptive_skip})")
+                    # logger.info(f"[{self.machine_id}]  Running YOLO inference on frame {self.frame_count} (skip={self.adaptive_skip})")
                     
                     results = model(
                         frame, 
@@ -468,93 +465,132 @@ class YOLOWorker(Process):
                     except Exception as e:
                         logger.error(f"[{self.machine_id}] Failed to encode original frame: {e}")
                 
-                # Detect Roll clamp (white/gray metal)
-                roll_clamp_detected = False
+                # OBB Detection (Independent of Person Detection)
+                clamp_detected = self.last_clamp_detected
+                clamp_confidence = self.last_clamp_confidence
+                clamp_bbox = self.last_clamp_bbox
+                clamp_angle = self.last_clamp_angle
+                paper_roll_detected = self.last_paper_roll_detected # Use persistent state
+
+                if config.ENABLE_OBB_CLAMP_DETECTION and obb_model:
+                    self.obb_frame_count += 1
+                    should_run_obb = (self.obb_frame_count % max(1, config.YOLO_OBB_FRAME_SKIP) == 0)
+                    
+                    if should_run_obb:
+                        try:
+                            # Inference
+                            obb_results = obb_model(
+                                frame,
+                                verbose=False,
+                                conf=config.YOLO_OBB_CONFIDENCE,
+                                imgsz=config.YOLO_IMG_SIZE,
+                                half=config.YOLO_HALF_PRECISION
+                            )
+                            
+                            if obb_results and len(obb_results) > 0:
+                                obb_r = obb_results[0]
+                                
+                                # Detect Paper Roll via OBB
+                                paper_roll_detected = self._detect_paper_roll(frame, obb_results=obb_r)
+
+                                # Detect Roll Clamp via OBB
+                                clamp_detected = self._detect_roll_clamp(frame, obb_results=obb_r)
+                                
+                                # If clamp detected, extract detailed OBB data for visualization
+                                if clamp_detected:
+                                    obb_data = obb_r.obb
+                                    class_ids = obb_data.cls.cpu().numpy().astype(int)
+                                    confs = obb_data.conf.cpu().numpy()
+                                    
+                                    # Find the best clamp instance (Class 0)
+                                    best_idx = -1
+                                    max_conf = 0
+                                    for idx, (cid, conf) in enumerate(zip(class_ids, confs)):
+                                        if cid == config.OBB_CLAMP_CLASS_ID and conf > max_conf:
+                                            max_conf = conf
+                                            best_idx = idx
+                                    
+                                    if best_idx != -1:
+                                        clamp_confidence = float(max_conf)
+                                        if hasattr(obb_data, 'xyxyxyxy'):
+                                            clamp_bbox = obb_data.xyxyxyxy.cpu().numpy()[best_idx].flatten().tolist()
+                                        if hasattr(obb_data, 'xywhr'):
+                                            clamp_angle = float(np.degrees(obb_data.xywhr.cpu().numpy()[best_idx][4]))
+                            
+                            # Update persistency
+                            self.last_clamp_detected = clamp_detected
+                            self.last_clamp_confidence = clamp_confidence
+                            self.last_clamp_bbox = clamp_bbox
+                            self.last_clamp_angle = clamp_angle
+                            self.last_paper_roll_detected = paper_roll_detected # Save state
+                            
+                        except Exception as e:
+                            logger.error(f"[{self.machine_id}] OBB detection error: {e}")
+                            traceback.print_exc()
+                
+                # Update main result_data
+                result_data['paper_roll_detected'] = paper_roll_detected
+                roll_clamp_detected = clamp_detected
+                result_data['roll_clamp_detected'] = roll_clamp_detected
+                result_data['clamp_confidence'] = clamp_confidence
+                result_data['clamp_bbox'] = clamp_bbox
+                result_data['clamp_angle'] = clamp_angle
+
+                # Update auto-start logic based on roll clamp
                 if config.ENABLE_ROLL_CLAMP_DETECTION:
-                    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-                    gray_bgr = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                    
-                    # Detect white/light gray metal (high brightness, low saturation)
-                    lower_metal = np.array([0, 0, 180])  # Low saturation, high value
-                    upper_metal = np.array([180, 50, 255])  # Any hue, low saturation, high brightness
-                    mask_metal = cv2.inRange(hsv, lower_metal, upper_metal)
-                    
-                    # Additional gray metal detection (medium brightness)
-                    _, gray_mask = cv2.threshold(gray_bgr, 150, 255, cv2.THRESH_BINARY)
-                    
-                    # Combine masks
-                    mask_combined = cv2.bitwise_or(mask_metal, gray_mask)
-                    metal_pixels = cv2.countNonZero(mask_combined)
-                    total_pixels = frame.shape[0] * frame.shape[1]
-                    metal_ratio = metal_pixels / total_pixels
-                    
-                    roll_clamp_detected = metal_ratio > config.ROLL_CLAMP_METAL_GRAY_THRESHOLD
-                    if roll_clamp_detected:
-                        logger.warning(f"[{self.machine_id}] ROLL CLAMP DETECTED! Metal ratio: {metal_ratio:.3f}")
-                    
                     # Check if Roll clamp was released (from detected → not detected)
                     if self.last_roll_clamp_detected and not roll_clamp_detected:
                         self.roll_clamp_released_time = time.time()
                         self.auto_start_triggered = False
-                        logger.warning(f"[{self.machine_id}] 🚨 ROLL CLAMP RELEASED! Starting {self.auto_start_delay_seconds}s delay timer for auto start")
+                        logger.warning(f"[{self.machine_id}]  ROLL CLAMP RELEASED! Starting {self.auto_start_delay_seconds}s delay timer for auto start")
                     
                     # Reset countdown if Roll clamp is detected again (forklift returns)
                     if roll_clamp_detected and self.roll_clamp_released_time is not None:
-                        logger.warning(f"[{self.machine_id}] ⚠️ Roll Clamp detected again - Resetting auto start countdown")
+                        logger.warning(f"[{self.machine_id}]  Roll Clamp detected again - Resetting auto start countdown")
                         self.roll_clamp_released_time = None
                         self.auto_start_triggered = False
                     
-                    # Check if we need to trigger auto start
-                    if self.roll_clamp_released_time is not None and not self.auto_start_triggered:
-                        elapsed = time.time() - self.roll_clamp_released_time
-                        if elapsed >= self.auto_start_delay_seconds:
-                            # Check if no person is detected in ROI before triggering
-                            if not final_detected:
-                                self.auto_start_triggered = True
-                                logger.warning(f"[{self.machine_id}]  AUTO START TRIGGERED! (after {elapsed:.1f}s delay, no person detected)")
-                                result_data['auto_start_signal'] = True
-                            else:
-                                logger.warning(f"[{self.machine_id}]  AUTO START DELAYED - Person detected in ROI! (elapsed: {elapsed:.1f}s)")
-                                # Reset timer to wait for person to leave
-                                self.roll_clamp_released_time = time.time()
-                        else:
-                            remaining = self.auto_start_delay_seconds - elapsed
-                            logger.info(f"[{self.machine_id}] Auto start countdown: {remaining:.1f}s remaining")
-                    
+                    # Update countdown display
+                    if self.last_roll_clamp_detected and not roll_clamp_detected and self.roll_clamp_released_time is not None:
+                         # Still counting down
+                         pass
+
                     self.last_roll_clamp_detected = roll_clamp_detected
-                    result_data['roll_clamp_detected'] = roll_clamp_detected
                     result_data['auto_start_countdown'] = (
                         self.auto_start_delay_seconds - (time.time() - self.roll_clamp_released_time)
                         if self.roll_clamp_released_time and not self.auto_start_triggered
                         else None
                     )
-
                 
-                # Detect paper roll (white/cream/brown)
-                if config.ENABLE_PAPER_ROLL_DETECTION:
-                    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-                    
-                    # White detection
-                    lower_white = np.array([0, 0, 200])
-                    upper_white = np.array([180, 25, 255])
-                    mask_white = cv2.inRange(hsv, lower_white, upper_white)
-                    
-                    # Cream/Brown detection
-                    lower_brown = np.array([10, 30, 100])
-                    upper_brown = np.array([40, 200, 255])
-                    mask_brown = cv2.inRange(hsv, lower_brown, upper_brown)
-                    
-                    # Combine masks
-                    mask_combined = cv2.bitwise_or(mask_white, mask_brown)
-                    paper_pixels = cv2.countNonZero(mask_combined)
-                    total_pixels = frame.shape[0] * frame.shape[1]
-                    paper_ratio = paper_pixels / total_pixels
-                    
-                    paper_roll_detected = paper_ratio > config.PAPER_ROLL_COLOR_RATIO_THRESHOLD
-                    if paper_roll_detected:
-                        logger.warning(f"[{self.machine_id}] PAPER ROLL DETECTED! Color ratio: {paper_ratio:.3f}")
-                    
-                    result_data['paper_roll_detected'] = paper_roll_detected
+                # ========== AUTO START SIGNAL CHECK ==========
+                # Check after OBB detection to verify both person and clamp status
+                if self.roll_clamp_released_time is not None and not self.auto_start_triggered:
+                    elapsed = time.time() - self.roll_clamp_released_time
+                    if elapsed >= self.auto_start_delay_seconds:
+                        # Check ALL conditions:
+                        # 1. No person in ROI
+                        # 2. No clamp detected (OBB)
+                        
+                        can_auto_start = True
+                        cancel_reason = []
+                        
+                        if final_detected:
+                            can_auto_start = False
+                            cancel_reason.append(f"Person in ROI (count: {person_count})")
+                        
+                        if config.ENABLE_OBB_CLAMP_DETECTION and clamp_detected:
+                            can_auto_start = False
+                            cancel_reason.append(f"Clamp present (conf: {clamp_confidence:.2f})")
+                        
+                        if can_auto_start:
+                            self.auto_start_triggered = True
+                            logger.warning(f"[{self.machine_id}]  AUTO START TRIGGERED! (after {elapsed:.1f}s delay)")
+                            logger.info(f"[{self.machine_id}] Auto start conditions: Person={final_detected}, Clamp={clamp_detected}")
+                            result_data['auto_start_signal'] = True
+                        else:
+                            logger.warning(f"[{self.machine_id}]  AUTO START DELAYED - {', '.join(cancel_reason)}")
+                            # Reset timer to wait for conditions to clear
+                            self.roll_clamp_released_time = time.time()
                 
                 # Attach frame if needed
                 if config.USE_RESULT_FRAME:
@@ -598,6 +634,31 @@ class YOLOWorker(Process):
                         y_pos = 110 if result_data.get('auto_start_countdown', None) is not None else 85
                         cv2.putText(vis_frame, paper_status, (10, y_pos), 
                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, paper_color, 2)
+                    
+                    # Display OBB Clamp status
+                    if config.ENABLE_OBB_CLAMP_DETECTION:
+                        clamp_status = f"OBB CLAMP: {'YES' if result_data.get('roll_clamp_detected', False) else 'NO'}"
+                        if result_data.get('roll_clamp_detected', False):
+                            clamp_conf = result_data.get('clamp_confidence', 0.0)
+                            clamp_ang = result_data.get('clamp_angle', 0.0)
+                            clamp_status += f" ({clamp_conf:.2f}, {clamp_ang:.0f}°)"
+                        clamp_color = (0, 165, 255) if result_data.get('roll_clamp_detected', False) else (128, 128, 128)
+                        y_pos_clamp = 135 if result_data.get('auto_start_countdown', None) is not None else 110
+                        cv2.putText(vis_frame, clamp_status, (10, y_pos_clamp), 
+                                  cv2.FONT_HERSHEY_SIMPLEX, 0.6, clamp_color, 2)
+                        
+                        # Draw OBB bounding box if detected
+                        if result_data.get('roll_clamp_detected', False) and result_data.get('clamp_bbox') is not None:
+                            bbox = result_data.get('clamp_bbox')
+                            if len(bbox) == 8:  # xyxyxyxy format
+                                pts = np.array([
+                                    [bbox[0], bbox[1]],
+                                    [bbox[2], bbox[3]],
+                                    [bbox[4], bbox[5]],
+                                    [bbox[6], bbox[7]]
+                                ], np.int32)
+                                pts = pts.reshape((-1, 1, 2))
+                                cv2.polylines(vis_frame, [pts], True, (0, 165, 255), 3)
                     
                     vis_frame = cv2.resize(vis_frame, (config.CAMERA_DISPLAY_WIDTH, config.CAMERA_DISPLAY_HEIGHT))
                     

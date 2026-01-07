@@ -69,6 +69,21 @@ ROLL_CLAMP_AUTO_START_DELAY = 180  # seconds (3 minutes) - delay after clamp rel
 ENABLE_PAPER_ROLL_DETECTION = True
 PAPER_ROLL_COLOR_RATIO_THRESHOLD = 0.3  # 30% white/cream/brown pixels = paper roll detected
 
+# YOLO OBB Clamp Detection
+ENABLE_OBB_CLAMP_DETECTION = True
+YOLO_OBB_MODEL_PATH = "models/yolo-obb-clamp.pt"
+YOLO_OBB_CONFIDENCE = 0.25  # Confidence threshold for OBB detection
+YOLO_OBB_FRAME_SKIP = 2  # Process every 2nd frame (reduced from 3 for better detection)
+CLAMP_PRESENT_THRESHOLD = 0.25  # FIXED: Must be <= YOLO_OBB_CONFIDENCE (was 0.5, causing detection failures!)
+
+# OBB Class Names (nc: 3)
+OBB_CLASS_NAMES = {
+    0: 'forklift_clamp',
+    1: 'paper_roll_small', 
+    2: 'paper_roll_big'
+}
+OBB_CLAMP_CLASS_ID = 0  # Only detect forklift_clamp for auto start logic
+
 # Temporal Smoothing
 USE_TEMPORAL_SMOOTHING = False
 DETECTION_MEMORY_FRAMES = 10
@@ -148,7 +163,7 @@ MODBUSWRAP_A_DI_CONFIG = {
     'digital_inputs': [
         {'label': 'Check_roll', 'addr': 0, 'type': 'DI'},
         {'label': 'Check_film', 'addr': 1, 'type': 'DI'},
-        {'label': 'Man/Auto', 'addr': 2, 'type': 'DI'},
+        {'label': 'Auto Mode', 'addr': 2, 'type': 'DI'},
         {'label': 'I4', 'addr': 3, 'type': 'DI'},
         {'label': 'Run', 'addr': 4, 'type': 'DI'},
         {'label': 'Ready', 'addr': 5, 'type': 'DI'},
@@ -161,7 +176,7 @@ MODBUSWRAP_B_DI_CONFIG = {
     'digital_inputs': [
         {'label': 'Check_roll', 'addr': 8, 'type': 'DI'},
         {'label': 'Check_film', 'addr': 9, 'type': 'DI'},
-        {'label': 'Man/Auto', 'addr': 10, 'type': 'DI'},
+        {'label': 'Auto Mode', 'addr': 10, 'type': 'DI'},
         {'label': 'I12', 'addr': 11, 'type': 'DI'},
         {'label': 'Run', 'addr': 12, 'type': 'DI'},
         {'label': 'Ready', 'addr': 13, 'type': 'DI'},
@@ -173,6 +188,11 @@ MODBUSWRAP_B_DI_CONFIG = {
 # Production Tracking
 PRODUCTION_RUN_DI_ADDR_A = 4   # Machine A wrapping status
 PRODUCTION_RUN_DI_ADDR_B = 12  # Machine B wrapping status
+
+# Auto/Manual Mode Tracking
+AUTO_MANUAL_MODE_DI_ADDR_A = 2   # Machine A: Man/Auto DI
+AUTO_MANUAL_MODE_DI_ADDR_B = 10  # Machine B: Man/Auto DI
+AUTO_MODE_DI_VALUE = True  # True = AUTO mode, False = MANUAL mode
 
 # Database
 DATABASE_PATH = "data/machine_events.db"
